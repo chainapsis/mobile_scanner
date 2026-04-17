@@ -49,6 +49,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
 #if os(iOS)
     var interfaceOrientationObserver: NSObjectProtocol?
+#else
+    var deviceConnectedObserver: NSObjectProtocol?
+    var deviceDisconnectedObserver: NSObjectProtocol?
 #endif
 
     private var stopped: Bool {
@@ -378,11 +381,17 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         timeoutSeconds = Double(timeoutMs) / 1000.0
         detectionSpeed = DetectionSpeed(rawValue: speed)!
 
-        // Set the camera to use. In macOS only a front camera is available.
+        // Set the camera to use.
 #if os(iOS)
         position = facing == 0 ? AVCaptureDevice.Position.front : .back
 #else
-        position = AVCaptureDevice.Position.front
+        // macOS: 0=front (built-in), 1=back, 2=external (USB webcam)
+        switch facing {
+        case 2:
+            position = AVCaptureDevice.Position.unspecified // external cameras
+        default:
+            position = AVCaptureDevice.Position.unspecified // try any camera on macOS
+        }
 #endif
 
         // Open the camera device based on position and lens type
@@ -396,6 +405,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
 
         device.addObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode), options: .new, context: nil)
+#if os(macOS)
+        isTorchObserverRegistered = true
+#endif
 #if os(iOS)
         device.addObserver(self, forKeyPath: #keyPath(AVCaptureDevice.videoZoomFactor), options: [.new, .initial], context: nil)
 #endif
@@ -435,7 +447,12 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
                 message: error.localizedDescription, details: nil))
             return
         }
+#if os(macOS)
+        // Higher resolution helps with dense QR codes from hardware wallets
+        captureSession!.sessionPreset = AVCaptureSession.Preset.photo
+#else
         captureSession!.sessionPreset = AVCaptureSession.Preset.high
+#endif
 
         let videoOutput = AVCaptureVideoDataOutput()
 
@@ -456,11 +473,27 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
             }
         }
 
+#if os(macOS)
+        // macOS: enable autofocus for better QR code recognition with webcams
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            do {
+                try device.lockForConfiguration()
+                device.focusMode = .continuousAutoFocus
+                device.unlockForConfiguration()
+            } catch {
+                NSLog("MobileScanner: failed to set autofocus: \(error)")
+            }
+        }
+#endif
+
         captureSession!.commitConfiguration()
 
 #if os(iOS)
         // Set up observer to update video orientation when interface orientation changes
         setupInterfaceOrientationObserver()
+#else
+        // macOS: observe camera connect/disconnect for hot-swap
+        setupDeviceObservers()
 #endif
 
         DispatchQueue.global(qos: .background).async {
@@ -843,6 +876,8 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     private func releaseCamera() {
 #if os(iOS)
         removeInterfaceOrientationObserver()
+#else
+        removeDeviceObservers()
 #endif
 
         if let captureSession = captureSession {
@@ -858,8 +893,13 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
 
         if let device = device {
+#if os(macOS)
+            if isTorchObserverRegistered {
+                device.removeObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode))
+                isTorchObserverRegistered = false
+            }
+#else
             device.removeObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode))
-#if os(iOS)
             device.removeObserver(self, forKeyPath: #keyPath(AVCaptureDevice.videoZoomFactor))
 #endif
             self.device = nil
@@ -875,6 +915,99 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         registry.unregisterTexture(textureId)
         textureId = nil
     }
+
+    // MARK: - macOS Camera Hot-Swap
+#if os(macOS)
+    /// Whether a KVO observer is currently registered on `device` for torchMode.
+    private var isTorchObserverRegistered = false
+
+    private static var externalDeviceType: AVCaptureDevice.DeviceType {
+        if #available(macOS 14.0, *) {
+            return .external
+        } else {
+            return .externalUnknown
+        }
+    }
+
+    private func setupDeviceObservers() {
+        deviceDisconnectedObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasDisconnected, object: nil, queue: nil
+        ) { [weak self] notification in
+            guard let self = self else { return }
+            // Capture device strongly before it goes nil (weak reference)
+            let currentDevice = self.device
+            guard let disconnected = notification.object as? AVCaptureDevice,
+                  disconnected.uniqueID == currentDevice?.uniqueID else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.switchToNextAvailableCamera(oldDevice: currentDevice)
+            }
+        }
+        deviceConnectedObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasConnected, object: nil, queue: nil
+        ) { [weak self] notification in
+            guard let self = self else { return }
+            guard let connected = notification.object as? AVCaptureDevice else { return }
+            let currentDevice = self.device
+            // If an external camera was connected and we're on built-in, switch to it
+            if connected.deviceType == MobileScannerPlugin.externalDeviceType
+                && currentDevice?.deviceType == .builtInWideAngleCamera {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    self.switchToCamera(connected, oldDevice: currentDevice)
+                }
+            }
+        }
+    }
+
+    private func removeDeviceObservers() {
+        if let observer = deviceDisconnectedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            deviceDisconnectedObserver = nil
+        }
+        if let observer = deviceConnectedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            deviceConnectedObserver = nil
+        }
+    }
+
+    private func switchToNextAvailableCamera(oldDevice: AVCaptureDevice?) {
+        let newDevice = MobileScannerCameraSelector.selectCamera(position: .unspecified, lensType: 0)
+        guard let newDevice = newDevice else { return }
+        switchToCamera(newDevice, oldDevice: oldDevice)
+    }
+
+    private func switchToCamera(_ newDevice: AVCaptureDevice, oldDevice: AVCaptureDevice?) {
+        guard let session = captureSession else { return }
+        session.beginConfiguration()
+
+        // Remove old inputs
+        for input in session.inputs {
+            session.removeInput(input)
+        }
+
+        // Remove old KVO observer safely
+        if let oldDevice = oldDevice, isTorchObserverRegistered {
+            oldDevice.removeObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode))
+            isTorchObserverRegistered = false
+        }
+
+        // Add new input
+        do {
+            let input = try AVCaptureDeviceInput(device: newDevice)
+            if session.canAddInput(input) {
+                session.addInput(input)
+                self.device = newDevice
+                newDevice.addObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode), options: .new, context: nil)
+                isTorchObserverRegistered = true
+            } else {
+                NSLog("MobileScanner: cannot add input for \(newDevice.localizedName)")
+            }
+        } catch {
+            NSLog("MobileScanner: failed to switch camera: \(error.localizedDescription)")
+        }
+
+        session.commitConfiguration()
+    }
+#endif
 
     func analyzeImage(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         // The iOS Simulator cannot use some of the GPU features that are required for the Vision API.
