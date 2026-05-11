@@ -1,6 +1,7 @@
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/src/enums/camera_facing.dart';
 import 'package:mobile_scanner/src/enums/torch_state.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
 
 /// This class defines the attributes for the mobile scanner view.
 class MobileScannerViewAttributes {
@@ -9,6 +10,7 @@ class MobileScannerViewAttributes {
     required this.cameraDirection,
     required this.currentTorchMode,
     required this.size,
+    this.camera,
     this.numberOfCameras,
     this.initialDeviceOrientation,
   });
@@ -18,6 +20,9 @@ class MobileScannerViewAttributes {
 
   /// The current torch state of the active camera.
   final TorchState currentTorchMode;
+
+  /// The active camera, when the platform exposes a camera descriptor.
+  final MobileScannerCameraInfo? camera;
 
   /// The number of available cameras.
   final int? numberOfCameras;

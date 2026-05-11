@@ -18,6 +18,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     // Sink for publishing event changes
     var sink: FlutterEventSink!
 
+    private var cameraConnectedObserver: NSObjectProtocol?
+    private var cameraDisconnectedObserver: NSObjectProtocol?
+
     // Texture id of the camera preview
     var textureId: Int64!
 
@@ -49,9 +52,6 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
 #if os(iOS)
     var interfaceOrientationObserver: NSObjectProtocol?
-#else
-    var deviceConnectedObserver: NSObjectProtocol?
-    var deviceDisconnectedObserver: NSObjectProtocol?
 #endif
 
     private var stopped: Bool {
@@ -91,6 +91,10 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         self.registry = registry
         super.init()
     }
+
+    deinit {
+        removeCameraListObservers()
+    }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
@@ -104,6 +108,8 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
             toggleTorch(result)
         case "getSupportedLenses":
             getSupportedLenses(result)
+        case "getAvailableCameras":
+            getAvailableCameras(result)
         case "setScale":
             setScale(call, result)
         case "setFocus":
@@ -126,11 +132,14 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     // FlutterStreamHandler
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         sink = events
+        setupCameraListObservers()
+        publishAvailableCameras()
         return nil
     }
     
     // FlutterStreamHandler
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        removeCameraListObservers()
         sink = nil
         return nil
     }
@@ -364,6 +373,7 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         let argReader = MapArgumentReader(call.arguments as? [String: Any])
 
         let torch:Bool = argReader.bool(key: "torch") ?? false
+        let cameraId:String? = argReader.string(key: "cameraId")
         let facing:Int = argReader.int(key: "facing") ?? 1
         let lensType:Int = argReader.int(key: "lensType") ?? -1
         let speed:Int = argReader.int(key: "speed") ?? 0
@@ -395,7 +405,7 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 #endif
 
         // Open the camera device based on position and lens type
-        device = MobileScannerCameraSelector.selectCamera(position: position, lensType: lensType)
+        device = MobileScannerCameraSelector.selectCamera(cameraId: cameraId, position: position, lensType: lensType)
 
         if (device == nil) {
             result(FlutterError(code: MobileScannerErrorCodes.NO_CAMERA_ERROR,
@@ -491,9 +501,6 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 #if os(iOS)
         // Set up observer to update video orientation when interface orientation changes
         setupInterfaceOrientationObserver()
-#else
-        // macOS: observe camera connect/disconnect for hot-swap
-        setupDeviceObservers()
 #endif
 
         DispatchQueue.global(qos: .background).async {
@@ -543,6 +550,8 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
                         "size": size,
                         "currentTorchState": device.hasTorch ? device.torchMode.rawValue : -1,
                         "cameraDirection": cameraDirection,
+                        "camera": MobileScannerCameraSelector.cameraInfo(for: device, isDefault: false),
+                        "numberOfCameras": MobileScannerCameraSelector.getAvailableCameras().count,
                         "initialDeviceOrientation": deviceVideoOrientation.toOrientationString
                     ]
                 } else {
@@ -588,6 +597,51 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
     private func getSupportedLenses(_ result: @escaping FlutterResult) {
         result(MobileScannerCameraSelector.getSupportedLenses())
+    }
+
+    private func getAvailableCameras(_ result: @escaping FlutterResult) {
+        result(MobileScannerCameraSelector.getAvailableCameras())
+    }
+
+    private func setupCameraListObservers() {
+        guard cameraConnectedObserver == nil && cameraDisconnectedObserver == nil else {
+            return
+        }
+
+        cameraConnectedObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasConnectedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.publishAvailableCameras()
+        }
+
+        cameraDisconnectedObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.publishAvailableCameras()
+        }
+    }
+
+    private func removeCameraListObservers() {
+        if let observer = cameraConnectedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            cameraConnectedObserver = nil
+        }
+
+        if let observer = cameraDisconnectedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            cameraDisconnectedObserver = nil
+        }
+    }
+
+    private func publishAvailableCameras() {
+        sink?([
+            "name": "cameras",
+            "data": MobileScannerCameraSelector.getAvailableCameras(),
+        ])
     }
 
     /// Turn the torch on.
@@ -876,8 +930,6 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     private func releaseCamera() {
 #if os(iOS)
         removeInterfaceOrientationObserver()
-#else
-        removeDeviceObservers()
 #endif
 
         if let captureSession = captureSession {
@@ -916,97 +968,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         textureId = nil
     }
 
-    // MARK: - macOS Camera Hot-Swap
 #if os(macOS)
     /// Whether a KVO observer is currently registered on `device` for torchMode.
     private var isTorchObserverRegistered = false
-
-    private static var externalDeviceType: AVCaptureDevice.DeviceType {
-        if #available(macOS 14.0, *) {
-            return .external
-        } else {
-            return .externalUnknown
-        }
-    }
-
-    private func setupDeviceObservers() {
-        deviceDisconnectedObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureDeviceWasDisconnected, object: nil, queue: nil
-        ) { [weak self] notification in
-            guard let self = self else { return }
-            // Capture device strongly before it goes nil (weak reference)
-            let currentDevice = self.device
-            guard let disconnected = notification.object as? AVCaptureDevice,
-                  disconnected.uniqueID == currentDevice?.uniqueID else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.switchToNextAvailableCamera(oldDevice: currentDevice)
-            }
-        }
-        deviceConnectedObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureDeviceWasConnected, object: nil, queue: nil
-        ) { [weak self] notification in
-            guard let self = self else { return }
-            guard let connected = notification.object as? AVCaptureDevice else { return }
-            let currentDevice = self.device
-            // If an external camera was connected and we're on built-in, switch to it
-            if connected.deviceType == MobileScannerPlugin.externalDeviceType
-                && currentDevice?.deviceType == .builtInWideAngleCamera {
-                DispatchQueue.global(qos: .userInitiated).async {
-                    self.switchToCamera(connected, oldDevice: currentDevice)
-                }
-            }
-        }
-    }
-
-    private func removeDeviceObservers() {
-        if let observer = deviceDisconnectedObserver {
-            NotificationCenter.default.removeObserver(observer)
-            deviceDisconnectedObserver = nil
-        }
-        if let observer = deviceConnectedObserver {
-            NotificationCenter.default.removeObserver(observer)
-            deviceConnectedObserver = nil
-        }
-    }
-
-    private func switchToNextAvailableCamera(oldDevice: AVCaptureDevice?) {
-        let newDevice = MobileScannerCameraSelector.selectCamera(position: .unspecified, lensType: 0)
-        guard let newDevice = newDevice else { return }
-        switchToCamera(newDevice, oldDevice: oldDevice)
-    }
-
-    private func switchToCamera(_ newDevice: AVCaptureDevice, oldDevice: AVCaptureDevice?) {
-        guard let session = captureSession else { return }
-        session.beginConfiguration()
-
-        // Remove old inputs
-        for input in session.inputs {
-            session.removeInput(input)
-        }
-
-        // Remove old KVO observer safely
-        if let oldDevice = oldDevice, isTorchObserverRegistered {
-            oldDevice.removeObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode))
-            isTorchObserverRegistered = false
-        }
-
-        // Add new input
-        do {
-            let input = try AVCaptureDeviceInput(device: newDevice)
-            if session.canAddInput(input) {
-                session.addInput(input)
-                self.device = newDevice
-                newDevice.addObserver(self, forKeyPath: #keyPath(AVCaptureDevice.torchMode), options: .new, context: nil)
-                isTorchObserverRegistered = true
-            } else {
-                NSLog("MobileScanner: cannot add input for \(newDevice.localizedName)")
-            }
-        } catch {
-            NSLog("MobileScanner: failed to switch camera: \(error.localizedDescription)")
-        }
-
-        session.commitConfiguration()
-    }
 #endif
 
     func analyzeImage(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {

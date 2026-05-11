@@ -20,10 +20,17 @@ class StartOptions {
     required this.invertImage,
     required this.autoZoom,
     required this.initialZoom,
+    this.cameraId,
   });
 
   /// The direction for the camera.
   final CameraFacing cameraDirection;
+
+  /// Platform-specific camera identifier.
+  ///
+  /// When provided, the native implementation should select this exact camera
+  /// instead of resolving one from [cameraDirection] and [cameraLensType].
+  final String? cameraId;
 
   /// The desired camera resolution for the scanner.
   final Size? cameraResolution;
@@ -76,6 +83,7 @@ class StartOptions {
           cameraResolution!.width.toInt(),
           cameraResolution!.height.toInt(),
         ],
+      if (cameraId != null) 'cameraId': cameraId,
       'facing': cameraDirection.rawValue,
       'lensType': cameraLensType.rawValue,
       if (formats.isNotEmpty)

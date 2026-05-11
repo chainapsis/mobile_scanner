@@ -13,6 +13,7 @@ import 'package:mobile_scanner/src/mobile_scanner_exception.dart';
 import 'package:mobile_scanner/src/mobile_scanner_platform_interface.dart';
 import 'package:mobile_scanner/src/mobile_scanner_view_attributes.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
 import 'package:mobile_scanner/src/objects/start_options.dart';
 import 'package:mobile_scanner/src/web/barcode_reader.dart';
 import 'package:mobile_scanner/src/web/media_track_constraints_delegate.dart';
@@ -38,6 +39,10 @@ class MobileScannerWeb extends MobileScannerPlatform {
 
   /// The subscription for the barcode stream.
   StreamSubscription<Object?>? _barcodesSubscription;
+
+  /// The stream controller for available camera list changes.
+  final StreamController<List<MobileScannerCameraInfo>> _camerasController =
+      StreamController.broadcast();
 
   /// The container div element for the camera view.
   late HTMLDivElement _divElement;
@@ -79,6 +84,10 @@ class MobileScannerWeb extends MobileScannerPlatform {
   @override
   Stream<double> get zoomScaleStateStream =>
       _settingsController.stream.map((_) => 1.0);
+
+  @override
+  Stream<List<MobileScannerCameraInfo>> get camerasStream =>
+      _camerasController.stream;
 
   /// Create the [HTMLVideoElement] along with its parent container
   /// [HTMLDivElement].
@@ -259,6 +268,44 @@ class MobileScannerWeb extends MobileScannerPlatform {
   }
 
   @override
+  Future<List<MobileScannerCameraInfo>> getAvailableCameras() async {
+    if (window.navigator.mediaDevices.isUndefinedOrNull) {
+      return <MobileScannerCameraInfo>[];
+    }
+
+    try {
+      final jsDevices =
+          await window.navigator.mediaDevices.enumerateDevices().toDart;
+      final devices = jsDevices.toDart
+          .where((device) => device.kind == 'videoinput')
+          .toList(growable: false);
+
+      return [
+        for (var i = 0; i < devices.length; i++)
+          MobileScannerCameraInfo(
+            id: devices[i].deviceId,
+            name:
+                devices[i].label.isEmpty ? 'Camera ${i + 1}' : devices[i].label,
+            facing: CameraFacing.unknown,
+            lensType: CameraLensType.any,
+            isDefault: i == 0,
+            isExternal: false,
+          ),
+      ];
+    } on DOMException {
+      return <MobileScannerCameraInfo>[];
+    }
+  }
+
+  Future<void> _emitAvailableCameras() async {
+    if (_camerasController.isClosed) {
+      return;
+    }
+
+    _camerasController.add(await getAvailableCameras());
+  }
+
+  @override
   Future<void> resetZoomScale() {
     throw UnsupportedError(
       'Setting the zoom scale is not supported for video tracks on the web.\n'
@@ -317,6 +364,13 @@ class MobileScannerWeb extends MobileScannerPlatform {
     }
 
     _barcodeReader = ZXingBarcodeReader();
+
+    if (!window.navigator.mediaDevices.isUndefinedOrNull) {
+      window.navigator.mediaDevices.ondevicechange =
+          ((Event _) {
+            unawaited(_emitAvailableCameras());
+          }).toJS;
+    }
 
     await _barcodeReader?.maybeLoadLibrary(
       alternateScriptUrl: _alternateScriptUrl,
@@ -438,6 +492,9 @@ class MobileScannerWeb extends MobileScannerPlatform {
   Future<void> dispose() async {
     // The `_barcodesController` and `_settingsController`
     // are not closed, as these have the same lifetime as the plugin.
+    if (!window.navigator.mediaDevices.isUndefinedOrNull) {
+      window.navigator.mediaDevices.ondevicechange = null;
+    }
     await stop();
   }
 }

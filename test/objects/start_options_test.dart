@@ -58,6 +58,27 @@ void main() {
       expect(map['cameraResolution'], [1920, 1080]);
     });
 
+    test('toMap includes cameraId when provided', () {
+      const options = StartOptions(
+        cameraDirection: CameraFacing.back,
+        cameraLensType: CameraLensType.any,
+        cameraResolution: null,
+        detectionSpeed: DetectionSpeed.normal,
+        detectionTimeoutMs: 250,
+        formats: [],
+        returnImage: false,
+        torchEnabled: false,
+        invertImage: false,
+        autoZoom: false,
+        initialZoom: null,
+        cameraId: 'camera-1',
+      );
+
+      final map = options.toMap();
+
+      expect(map['cameraId'], 'camera-1');
+    });
+
     test('toMap excludes camera resolution when null', () {
       const options = StartOptions(
         cameraDirection: CameraFacing.back,

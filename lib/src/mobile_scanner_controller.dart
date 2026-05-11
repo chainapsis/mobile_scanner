@@ -18,6 +18,7 @@ import 'package:mobile_scanner/src/method_channel/mobile_scanner_method_channel.
 import 'package:mobile_scanner/src/mobile_scanner_exception.dart';
 import 'package:mobile_scanner/src/mobile_scanner_platform_interface.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
 import 'package:mobile_scanner/src/objects/mobile_scanner_state.dart';
 import 'package:mobile_scanner/src/objects/start_options.dart';
 import 'package:mobile_scanner/src/objects/switch_camera_option.dart';
@@ -28,6 +29,7 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
   MobileScannerController({
     this.autoStart = true,
     this.cameraResolution,
+    this.cameraId,
     this.lensType = CameraLensType.any,
     this.detectionSpeed = DetectionSpeed.normal,
     int detectionTimeoutMs = 250,
@@ -64,6 +66,11 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
   ///
   /// Currently only supported on Android.
   final Size? cameraResolution;
+
+  /// Platform-specific camera identifier to select on startup.
+  ///
+  /// When provided, this takes precedence over [facing] and [lensType].
+  final String? cameraId;
 
   /// Automatically start the scanner on initialization.
   final bool autoStart;
@@ -143,6 +150,10 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
   /// If an error occurred during the detection of a barcode,
   /// a [MobileScannerBarcodeException] error is emitted to the stream.
   Stream<BarcodeCapture> get barcodes => _barcodesController.stream;
+
+  /// Get the stream of available camera list changes.
+  Stream<List<MobileScannerCameraInfo>> get camerasStream =>
+      MobileScannerPlatform.instance.camerasStream;
 
   StreamSubscription<BarcodeCapture?>? _barcodesSubscription;
   StreamSubscription<TorchState>? _torchStateSubscription;
@@ -378,6 +389,7 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
   /// If the permission is denied on iOS, MacOS or Web, there is no way to
   /// request it again.
   Future<void> start({
+    String? cameraId,
     CameraFacing? cameraDirection,
     CameraLensType? cameraLensType,
   }) async {
@@ -460,6 +472,7 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
       invertImage: invertImage,
       autoZoom: autoZoom,
       initialZoom: initialZoom,
+      cameraId: cameraId ?? this.cameraId,
     );
 
     try {
@@ -472,6 +485,7 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
       if (!_isDisposed) {
         value = value.copyWith(
           availableCameras: viewAttributes.numberOfCameras,
+          camera: viewAttributes.camera,
           cameraDirection: viewAttributes.cameraDirection,
           cameraLensType: options.cameraLensType,
           isInitialized: true,
@@ -491,6 +505,7 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
       if (!_isDisposed) {
         value = value.copyWith(
           cameraDirection: CameraFacing.unknown,
+          camera: null,
           isInitialized: true,
           isStarting: false,
           isRunning: false,
@@ -550,8 +565,13 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
         await _toggleCameraDirection();
       case ToggleLensType():
         await _toggleLensType();
-      case SelectCamera(:final facingDirection, :final lensType):
+      case SelectCamera(
+        :final cameraId,
+        :final facingDirection,
+        :final lensType,
+      ):
         await _selectCamera(
+          cameraId: cameraId,
           facingDirection: facingDirection,
           lensType: lensType,
         );
@@ -643,9 +663,19 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
   }
 
   Future<void> _selectCamera({
+    String? cameraId,
     CameraFacing? facingDirection,
     CameraLensType lensType = CameraLensType.any,
   }) async {
+    if (cameraId != null) {
+      if (cameraId == value.camera?.id) {
+        return;
+      }
+
+      await stop();
+      return start(cameraId: cameraId);
+    }
+
     // Use current direction if not specified.
     final targetDirection = facingDirection ?? value.cameraDirection;
 
@@ -738,6 +768,23 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
     }
 
     return MobileScannerPlatform.instance.getSupportedLenses();
+  }
+
+  /// Get the list of available cameras.
+  ///
+  /// The returned [MobileScannerCameraInfo.id] can be used with [start] or
+  /// [SelectCamera.cameraId] to select an exact camera.
+  Future<List<MobileScannerCameraInfo>> getAvailableCameras() async {
+    if (_isDisposed) {
+      throw MobileScannerException(
+        errorCode: MobileScannerErrorCode.controllerDisposed,
+        errorDetails: MobileScannerErrorDetails(
+          message: MobileScannerErrorCode.controllerDisposed.message,
+        ),
+      );
+    }
+
+    return MobileScannerPlatform.instance.getAvailableCameras();
   }
 
   /// Dispose the controller.

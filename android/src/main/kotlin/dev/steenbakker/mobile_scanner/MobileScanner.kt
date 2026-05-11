@@ -10,6 +10,7 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.VisibleForTesting
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.Camera2Config
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -494,6 +495,23 @@ class MobileScanner(
             val sensorRotationDegrees = camera?.cameraInfo?.sensorRotationDegrees ?: 0
             val portrait = sensorRotationDegrees % 180 == 0
             val cameraDirection = getCameraLensFacing(camera)
+            val cameraInfo = camera?.cameraInfo?.let { info ->
+                try {
+                    val cameraId = Camera2CameraInfo.from(info).cameraId
+                    val cameraManager = activity.getSystemService(
+                        android.content.Context.CAMERA_SERVICE,
+                    ) as android.hardware.camera2.CameraManager
+                    val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                    MobileScannerCameraLensSelector.cameraInfo(
+                        cameraId,
+                        characteristics,
+                        isDefault = false,
+                    )
+                } catch (e: Exception) {
+                    Log.w("MobileScanner", "Failed to build camera info", e)
+                    null
+                }
+            }
 
             // Start with 'unavailable' torch state.
             var currentTorchState: Int = -1
@@ -519,6 +537,7 @@ class MobileScanner(
                     surfaceProducer!!.id(),
                     numberOfCameras ?: 0,
                     cameraDirection,
+                    cameraInfo,
                 )
             )
         }, mainExecutor)

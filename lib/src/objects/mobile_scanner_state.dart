@@ -7,6 +7,9 @@ import 'package:mobile_scanner/src/enums/camera_lens_type.dart';
 import 'package:mobile_scanner/src/enums/mobile_scanner_error_code.dart';
 import 'package:mobile_scanner/src/enums/torch_state.dart';
 import 'package:mobile_scanner/src/mobile_scanner_exception.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
+
+const Object _unset = Object();
 
 /// This class represents the current state of a [MobileScannerController].
 class MobileScannerState {
@@ -22,6 +25,7 @@ class MobileScannerState {
     required this.torchState,
     required this.zoomScale,
     required this.deviceOrientation,
+    this.camera,
     this.error,
   });
 
@@ -29,6 +33,7 @@ class MobileScannerState {
   const MobileScannerState.uninitialized()
     : this(
         availableCameras: null,
+        camera: null,
         cameraDirection: CameraFacing.unknown,
         cameraLensType: CameraLensType.any,
         isInitialized: false,
@@ -44,6 +49,9 @@ class MobileScannerState {
   ///
   /// This is null if the number of cameras is unknown.
   final int? availableCameras;
+
+  /// The active camera, when the platform exposes a camera descriptor.
+  final MobileScannerCameraInfo? camera;
 
   /// The facing direction of the camera.
   final CameraFacing cameraDirection;
@@ -92,6 +100,7 @@ class MobileScannerState {
   /// Create a copy of this state with the given parameters.
   MobileScannerState copyWith({
     int? availableCameras,
+    Object? camera = _unset,
     CameraFacing? cameraDirection,
     CameraLensType? cameraLensType,
     MobileScannerException? error,
@@ -105,6 +114,9 @@ class MobileScannerState {
   }) {
     return MobileScannerState(
       availableCameras: availableCameras ?? this.availableCameras,
+      camera: identical(camera, _unset)
+          ? this.camera
+          : camera as MobileScannerCameraInfo?,
       cameraDirection: cameraDirection ?? this.cameraDirection,
       cameraLensType: cameraLensType ?? this.cameraLensType,
       error: error,

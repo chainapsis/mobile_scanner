@@ -16,6 +16,7 @@ import 'package:mobile_scanner/src/mobile_scanner_platform_interface.dart';
 import 'package:mobile_scanner/src/mobile_scanner_view_attributes.dart';
 import 'package:mobile_scanner/src/objects/barcode.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
 import 'package:mobile_scanner/src/objects/start_options.dart';
 import 'package:mobile_scanner/src/utils/parse_device_orientation_extension.dart';
 
@@ -42,6 +43,10 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
   /// The name of the zoom scale state event.
   @visibleForTesting
   static const String kZoomScaleStateEventName = 'zoomScaleState';
+
+  /// The name of the available cameras event.
+  @visibleForTesting
+  static const String kCamerasEventName = 'cameras';
 
   /// The name of the method that gets the camera authorization state.
   @visibleForTesting
@@ -90,6 +95,10 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
   /// The name of the method that gets the supported camera lenses.
   @visibleForTesting
   static const String kGetSupportedLensesMethodName = 'getSupportedLenses';
+
+  /// The name of the method that gets the available cameras.
+  @visibleForTesting
+  static const String kGetAvailableCamerasMethodName = 'getAvailableCameras';
 
   /// The method channel used to interact with the native platform.
   @visibleForTesting
@@ -176,6 +185,19 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     );
   }
 
+  List<MobileScannerCameraInfo> _parseCameras(Map<Object?, Object?> event) {
+    final data = event['data'];
+
+    if (data == null || data is! List<Object?>) {
+      return <MobileScannerCameraInfo>[];
+    }
+
+    return data
+        .whereType<Map<Object?, Object?>>()
+        .map(MobileScannerCameraInfo.fromMap)
+        .toList(growable: false);
+  }
+
   /// Parse a [MobileScannerBarcodeException] from the given [error] and
   /// [stackTrace], and throw it.
   ///
@@ -259,6 +281,13 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     return eventsStream
         .where((event) => event['name'] == kZoomScaleStateEventName)
         .map((event) => event['data'] as double? ?? 0.0);
+  }
+
+  @override
+  Stream<List<MobileScannerCameraInfo>> get camerasStream {
+    return eventsStream
+        .where((event) => event['name'] == kCamerasEventName)
+        .map(_parseCameras);
   }
 
   @override
@@ -401,6 +430,12 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     final cameraDirection = CameraFacing.fromRawValue(
       startResult['cameraDirection'] as int?,
     );
+    final camera = switch (startResult['camera']) {
+      final Map<Object?, Object?> cameraMap => MobileScannerCameraInfo.fromMap(
+        cameraMap,
+      ),
+      _ => null,
+    };
 
     _textureId = textureId;
 
@@ -440,6 +475,7 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     _pausing = false;
 
     return MobileScannerViewAttributes(
+      camera: camera,
       cameraDirection: cameraDirection,
       currentTorchMode: currentTorchState,
       numberOfCameras: numberOfCameras,
@@ -511,6 +547,22 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     }
 
     return lensTypes.whereType<int>().map(CameraLensType.fromRawValue).toSet();
+  }
+
+  @override
+  Future<List<MobileScannerCameraInfo>> getAvailableCameras() async {
+    final cameras = await methodChannel.invokeListMethod<Object?>(
+      kGetAvailableCamerasMethodName,
+    );
+
+    if (cameras == null || cameras.isEmpty) {
+      return <MobileScannerCameraInfo>[];
+    }
+
+    return cameras
+        .whereType<Map<Object?, Object?>>()
+        .map(MobileScannerCameraInfo.fromMap)
+        .toList(growable: false);
   }
 
   @override

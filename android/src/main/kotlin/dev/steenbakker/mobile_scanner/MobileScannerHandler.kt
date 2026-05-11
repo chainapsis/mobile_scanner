@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraManager.AvailabilityCallback
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -97,6 +98,17 @@ class MobileScannerHandler(
         barcodeHandler.publishEvent(mapOf("name" to "zoomScaleState", "data" to zoomScale))
     }
 
+    @OptIn(ExperimentalLensFacing::class)
+    private val cameraAvailabilityCallback = object : AvailabilityCallback() {
+        override fun onCameraAvailable(cameraId: String) {
+            publishAvailableCameras()
+        }
+
+        override fun onCameraUnavailable(cameraId: String) {
+            publishAvailableCameras()
+        }
+    }
+
     init {
         methodChannel = MethodChannel(binaryMessenger,
             "dev.steenbakker.mobile_scanner/scanner/method")
@@ -110,9 +122,15 @@ class MobileScannerHandler(
 
         mobileScanner = MobileScanner(
             activity, textureRegistry, callback, errorCallback, deviceOrientationListener)
+
+        cameraManager.registerAvailabilityCallback(
+            cameraAvailabilityCallback,
+            Handler(Looper.getMainLooper()),
+        )
     }
 
     fun dispose(activityPluginBinding: ActivityPluginBinding) {
+        cameraManager.unregisterAvailabilityCallback(cameraAvailabilityCallback)
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
         deviceOrientationChannel?.setStreamHandler(null)
@@ -154,6 +172,7 @@ class MobileScannerHandler(
             "stop" -> stop(call, result)
             "toggleTorch" -> toggleTorch(result)
             "getSupportedLenses" -> getSupportedLenses(result)
+            "getAvailableCameras" -> getAvailableCameras(result)
             "analyzeImage" -> analyzeImage(call, result)
             "setScale" -> setScale(call, result)
             "resetScale" -> resetScale(result)
@@ -167,6 +186,7 @@ class MobileScannerHandler(
     @ExperimentalGetImage
     private fun start(call: MethodCall, result: MethodChannel.Result) {
         val torch: Boolean = call.argument<Boolean>("torch") ?: false
+        val cameraId: String? = call.argument<String>("cameraId")
         val facing: Int = call.argument<Int>("facing") ?: 0
         val lensType: Int = call.argument<Int>("lensType") ?: -1
         val formats: List<Int>? = call.argument<List<Int>>("formats")
@@ -185,7 +205,12 @@ class MobileScannerHandler(
 
         val barcodeScannerOptions: BarcodeScannerOptions? = buildBarcodeScannerOptions(formats, autoZoom)
 
-        val position = MobileScannerCameraLensSelector.selectCamera(cameraManager, facing, lensType)
+        val position = MobileScannerCameraLensSelector.selectCamera(
+            cameraManager,
+            facing,
+            lensType,
+            cameraId,
+        )
 
         val detectionSpeed: DetectionSpeed = when (speed) {
             0 -> DetectionSpeed.NO_DUPLICATES
@@ -211,7 +236,8 @@ class MobileScannerHandler(
                         "sensorOrientation" to it.sensorOrientation,
                         "currentTorchState" to it.currentTorchState,
                         "numberOfCameras" to it.numberOfCameras,
-                        "cameraDirection" to it.cameraDirection
+                        "cameraDirection" to it.cameraDirection,
+                        "camera" to it.cameraInfo,
                     ))
                 }
             },
@@ -311,6 +337,27 @@ class MobileScannerHandler(
                 null
             )
         }
+    }
+
+    @ExperimentalLensFacing
+    private fun getAvailableCameras(result: MethodChannel.Result) {
+        try {
+            result.success(MobileScannerCameraLensSelector.getAvailableCameras(cameraManager))
+        } catch (e: Exception) {
+            result.error(
+                MobileScannerErrorCodes.GENERIC_ERROR,
+                MobileScannerErrorCodes.GENERIC_ERROR_MESSAGE,
+                e.localizedMessage,
+            )
+        }
+    }
+
+    @ExperimentalLensFacing
+    private fun publishAvailableCameras() {
+        barcodeHandler.publishEvent(mapOf(
+            "name" to "cameras",
+            "data" to MobileScannerCameraLensSelector.getAvailableCameras(cameraManager),
+        ))
     }
 
     private fun setScale(call: MethodCall, result: MethodChannel.Result) {

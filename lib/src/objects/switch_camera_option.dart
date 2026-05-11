@@ -38,24 +38,33 @@ final class ToggleLensType extends SwitchCameraOption {
 }
 
 /// An implementation of [SwitchCameraOption] that selects
-/// a specific camera direction and/or lens type.
+/// a specific camera id, camera direction, and/or lens type.
 ///
 /// Use this option to switch to a specific camera configuration.
 ///
+/// If [cameraId] is provided, it takes precedence over [facingDirection] and
+/// [lensType].
 /// If [facingDirection] is `null`, the current facing direction is kept.
 /// If [lensType] is [CameraLensType.any] (the default), the default lens
 /// for the facing direction will be used.
 final class SelectCamera extends SwitchCameraOption {
   /// Creates a select camera request.
   ///
+  /// If [cameraId] is provided, it takes precedence over [facingDirection] and
+  /// [lensType].
+  ///
   /// If [facingDirection] is `null`, the current facing direction is kept.
   ///
   /// The [lensType] defaults to [CameraLensType.any], which allows
   /// selecting any available lens for the given facing direction.
   const SelectCamera({
+    this.cameraId,
     this.facingDirection,
     this.lensType = CameraLensType.any,
   });
+
+  /// The platform-specific camera identifier to switch to.
+  final String? cameraId;
 
   /// The desired facing direction to switch to.
   ///

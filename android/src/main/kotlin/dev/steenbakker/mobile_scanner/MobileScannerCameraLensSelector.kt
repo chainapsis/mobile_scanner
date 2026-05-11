@@ -7,6 +7,7 @@ import android.util.Log
 import android.util.SizeF
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalLensFacing
 import kotlin.math.sqrt
 
 /**
@@ -260,6 +261,60 @@ object MobileScannerCameraLensSelector {
     }
 
     /**
+     * Get the list of cameras that can be presented to Dart.
+     */
+    @ExperimentalLensFacing
+    fun getAvailableCameras(cameraManager: CameraManager): List<Map<String, Any?>> {
+        return try {
+            cameraManager.cameraIdList.mapIndexed { index, cameraId ->
+                val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                cameraInfo(cameraId, characteristics, isDefault = index == 0)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to enumerate cameras", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Converts Camera2 characteristics into a platform-channel-safe map.
+     */
+    @ExperimentalLensFacing
+    fun cameraInfo(
+        cameraId: String,
+        characteristics: CameraCharacteristics,
+        isDefault: Boolean,
+    ): Map<String, Any?> {
+        val facing = cameraFacing(characteristics)
+        val lensType = getLensTypeFromCharacteristics(characteristics) ?: LENS_TYPE_ANY
+        val name = when (facing) {
+            0 -> "Front camera"
+            1 -> "Back camera"
+            2 -> "External camera"
+            else -> "Camera"
+        }
+
+        return mapOf(
+            "id" to cameraId,
+            "name" to "$name $cameraId",
+            "facing" to facing,
+            "lensType" to lensType,
+            "isDefault" to isDefault,
+            "isExternal" to (facing == 2),
+        )
+    }
+
+    @ExperimentalLensFacing
+    private fun cameraFacing(characteristics: CameraCharacteristics): Int {
+        return when (characteristics.get(CameraCharacteristics.LENS_FACING)) {
+            CameraCharacteristics.LENS_FACING_FRONT -> 0
+            CameraCharacteristics.LENS_FACING_BACK -> 1
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> 2
+            else -> -1
+        }
+    }
+
+    /**
      * Select the appropriate camera based on facing direction and lens type.
      *
      * Uses 35mm equivalent focal length calculation for accurate lens classification.
@@ -269,12 +324,38 @@ object MobileScannerCameraLensSelector {
      * @param lensType [LENS_TYPE_NORMAL], [LENS_TYPE_WIDE], [LENS_TYPE_ZOOM], or [LENS_TYPE_ANY]
      * @return CameraSelector configured for the desired camera
      */
-    fun selectCamera(cameraManager: CameraManager, facing: Int, lensType: Int): CameraSelector {
-        val lensFacing = if (facing == 0) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+    @ExperimentalLensFacing
+    fun selectCamera(cameraManager: CameraManager, facing: Int, lensType: Int, cameraId: String? = null): CameraSelector {
+        if (cameraId != null) {
+            return CameraSelector.Builder()
+                .addCameraFilter { cameraInfos ->
+                    cameraInfos.filter { cameraInfo ->
+                        try {
+                            Camera2CameraInfo.from(cameraInfo).cameraId == cameraId
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to get camera id", e)
+                            false
+                        }
+                    }
+                }
+                .build()
+        }
+
+        val lensFacing = when (facing) {
+            0 -> CameraSelector.LENS_FACING_FRONT
+            2 -> CameraSelector.LENS_FACING_EXTERNAL
+            else -> CameraSelector.LENS_FACING_BACK
+        }
 
         // If no specific lens type is requested, return default camera for facing direction
         if (lensType == LENS_TYPE_ANY) {
-            return if (facing == 0) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+            return when (facing) {
+                0 -> CameraSelector.DEFAULT_FRONT_CAMERA
+                2 -> CameraSelector.Builder()
+                    .requireLensFacing(CameraSelector.LENS_FACING_EXTERNAL)
+                    .build()
+                else -> CameraSelector.DEFAULT_BACK_CAMERA
+            }
         }
 
         // Build a camera selector that filters by both facing and lens characteristics

@@ -5,6 +5,7 @@ import 'package:mobile_scanner/src/enums/torch_state.dart';
 import 'package:mobile_scanner/src/method_channel/mobile_scanner_method_channel.dart';
 import 'package:mobile_scanner/src/mobile_scanner_view_attributes.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
+import 'package:mobile_scanner/src/objects/mobile_scanner_camera_info.dart';
 import 'package:mobile_scanner/src/objects/start_options.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
@@ -43,6 +44,11 @@ abstract class MobileScannerPlatform extends PlatformInterface {
   /// Get the stream of zoom scale changes.
   Stream<double> get zoomScaleStateStream {
     throw UnimplementedError('zoomScaleStateStream has not been implemented.');
+  }
+
+  /// Get the stream of available camera list changes.
+  Stream<List<MobileScannerCameraInfo>> get camerasStream {
+    throw UnimplementedError('camerasStream has not been implemented.');
   }
 
   /// Analyze a local image file for barcodes.
@@ -130,6 +136,13 @@ abstract class MobileScannerPlatform extends PlatformInterface {
   /// This method can be called before starting the scanner.
   Future<Set<CameraLensType>> getSupportedLenses() {
     throw UnimplementedError('getSupportedLenses() has not been implemented.');
+  }
+
+  /// Get the list of available cameras.
+  ///
+  /// The returned identifiers can be passed to [StartOptions.cameraId].
+  Future<List<MobileScannerCameraInfo>> getAvailableCameras() {
+    throw UnimplementedError('getAvailableCameras() has not been implemented.');
   }
 
   /// Update the scan window to the given [window] rectangle.

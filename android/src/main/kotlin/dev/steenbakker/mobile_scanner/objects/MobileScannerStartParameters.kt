@@ -10,4 +10,5 @@ class MobileScannerStartParameters(
     val id: Long,
     val numberOfCameras: Int,
     val cameraDirection: Int?,
+    val cameraInfo: Map<String, Any?>?,
 )
