@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import Vision
 import VideoToolbox
 
@@ -32,6 +33,10 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
     // Image to be sent to the texture
     var latestBuffer: CVImageBuffer!
+
+#if os(macOS)
+    private let previewFlipContext = CIContext()
+#endif
 
     // optional window to limit scan search
     var scanWindow: CGRect?
@@ -150,8 +155,49 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
             return nil
         }
 
+#if os(macOS)
+        if let flippedBuffer = makeHorizontallyFlippedPreviewBuffer(buffer) {
+            return Unmanaged<CVPixelBuffer>.passRetained(flippedBuffer)
+        }
+#endif
+
         return Unmanaged<CVPixelBuffer>.passRetained(buffer)
     }
+
+#if os(macOS)
+    private func makeHorizontallyFlippedPreviewBuffer(_ buffer: CVImageBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+
+        var outputBuffer: CVPixelBuffer?
+        let attributes = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferMetalCompatibilityKey: true,
+        ] as CFDictionary
+
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            pixelFormat,
+            attributes,
+            &outputBuffer
+        )
+        guard status == kCVReturnSuccess, let outputBuffer else {
+            return nil
+        }
+
+        let image = CIImage(cvPixelBuffer: buffer)
+        let flippedImage = image.transformed(
+            by: CGAffineTransform(translationX: CGFloat(width), y: 0)
+                .scaledBy(x: -1, y: 1)
+        )
+        previewFlipContext.render(flippedImage, to: outputBuffer)
+        return outputBuffer
+    }
+#endif
     
     var nextScanTime = 0.0
     var imagesCurrentlyBeingProcessed = false
