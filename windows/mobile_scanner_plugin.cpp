@@ -314,15 +314,54 @@ struct NativeMediaTypeCandidate {
 };
 
 int64_t NativeTypeScore(FrameFormat format, UINT32 width, UINT32 height) {
-  constexpr int64_t kTargetArea = 1280LL * 720LL;
-  constexpr int64_t kMinimumUsefulArea = 640LL * 480LL;
+  constexpr int64_t kTargetArea = 1920LL * 1080LL;
+  constexpr int64_t kMinimumUsefulArea = 1280LL * 720LL;
   const int64_t area = static_cast<int64_t>(width) * height;
-  const int64_t area_delta =
-      area > kTargetArea ? area - kTargetArea : kTargetArea - area;
+  const int64_t area_delta = area > kTargetArea
+                                 ? (area - kTargetArea) * 2
+                                 : (kTargetArea - area) * 4;
   const int64_t low_resolution_penalty =
       area < kMinimumUsefulArea ? kTargetArea : 0;
-  return static_cast<int64_t>(FormatRank(format)) * 100000 +
+  return static_cast<int64_t>(FormatRank(format)) * 1000 +
          low_resolution_penalty + (area_delta / 1000);
+}
+
+bool FindPreferredNativeFrameSize(IMFSourceReader* source_reader,
+                                  UINT32* selected_width,
+                                  UINT32* selected_height) {
+  bool found = false;
+  int64_t best_score = std::numeric_limits<int64_t>::max();
+
+  for (DWORD index = 0;; ++index) {
+    Microsoft::WRL::ComPtr<IMFMediaType> native_type;
+    const HRESULT result = source_reader->GetNativeMediaType(
+        kFirstVideoStream, index, &native_type);
+    if (result == MF_E_NO_MORE_TYPES) {
+      break;
+    }
+    if (FAILED(result)) {
+      continue;
+    }
+
+    FrameFormat format = FrameFormat::kBgra32;
+    UINT32 width = 0;
+    UINT32 height = 0;
+    LONG stride = 0;
+    if (!ReadSupportedVideoType(native_type.Get(), &format, &width, &height,
+                                &stride)) {
+      continue;
+    }
+
+    const int64_t score = NativeTypeScore(format, width, height);
+    if (!found || score < best_score) {
+      found = true;
+      best_score = score;
+      *selected_width = width;
+      *selected_height = height;
+    }
+  }
+
+  return found;
 }
 
 HRESULT SetRgb32Output(
@@ -341,8 +380,21 @@ HRESULT SetRgb32Output(
   if (FAILED(result)) {
     return result;
   }
+  UINT32 preferred_width = 0;
+  UINT32 preferred_height = 0;
+  const bool has_preferred_size =
+      FindPreferredNativeFrameSize(source_reader, &preferred_width,
+                                   &preferred_height) &&
+      SUCCEEDED(MFSetAttributeSize(output_type.Get(), MF_MT_FRAME_SIZE,
+                                   preferred_width, preferred_height));
+
   result = source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
                                               output_type.Get());
+  if (FAILED(result) && has_preferred_size) {
+    output_type->DeleteItem(MF_MT_FRAME_SIZE);
+    result = source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
+                                                output_type.Get());
+  }
   if (FAILED(result)) {
     return result;
   }
