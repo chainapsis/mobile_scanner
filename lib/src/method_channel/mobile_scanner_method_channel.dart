@@ -134,8 +134,9 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
 
   /// Get the event stream of barcode events that come from the [eventChannel].
   Stream<Map<Object?, Object?>> get eventsStream {
-    _eventsStream ??=
-        eventChannel.receiveBroadcastStream().cast<Map<Object?, Object?>>();
+    _eventsStream ??= eventChannel
+        .receiveBroadcastStream()
+        .cast<Map<Object?, Object?>>();
 
     return _eventsStream!;
   }
@@ -163,7 +164,8 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
 
     if (defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS ||
-        defaultTargetPlatform == TargetPlatform.macOS) {
+        defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.windows) {
       final imageData = event['image'] as Map<Object?, Object?>?;
       final image = imageData?['bytes'] as Uint8List?;
       final width = imageData?['width'] as double?;
@@ -300,13 +302,12 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
         kAnalyzeImageMethodName,
         {
           'filePath': path,
-          'formats':
-              formats.isEmpty
-                  ? null
-                  : [
-                    for (final BarcodeFormat format in formats)
-                      if (format != BarcodeFormat.unknown) format.rawValue,
-                  ],
+          'formats': formats.isEmpty
+              ? null
+              : [
+                  for (final BarcodeFormat format in formats)
+                    if (format != BarcodeFormat.unknown) format.rawValue,
+                ],
         },
       );
 
