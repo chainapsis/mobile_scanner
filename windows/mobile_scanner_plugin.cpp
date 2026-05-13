@@ -483,6 +483,18 @@ bool SelectNativeMediaType(IMFSourceReader* source_reader,
   return false;
 }
 
+std::optional<std::string> ReadQrFromImage(
+    const ZXing::ImageView& image,
+    const ZXing::ReaderOptions& options) {
+  const auto barcodes = ZXing::ReadBarcodes(image, options);
+  for (const auto& barcode : barcodes) {
+    if (barcode.isValid()) {
+      return barcode.text();
+    }
+  }
+  return std::nullopt;
+}
+
 void ReleaseActivateArray(IMFActivate** devices, UINT32 count) {
   if (devices == nullptr) {
     return;
@@ -642,6 +654,7 @@ void MobileScannerPlugin::Start(
   last_detected_value_.clear();
   last_detection_time_ = std::chrono::steady_clock::time_point{};
   last_decode_attempt_ = std::chrono::steady_clock::time_point{};
+  decode_attempt_count_ = 0;
 
   int width = 0;
   int height = 0;
@@ -1180,8 +1193,13 @@ void MobileScannerPlugin::DecodeFrame(const std::vector<uint8_t>& rgba,
     return;
   }
   last_decode_attempt_ = now;
+  ++decode_attempt_count_;
 
-  const auto value = DecodeQr(rgba, width, height);
+  const bool include_full_frame_fallback =
+      (decode_attempt_count_ % 5 == 0) ||
+      detection_speed_ == kDetectionUnrestricted;
+  const auto value =
+      DecodeQr(rgba, width, height, include_full_frame_fallback);
   if (!value || value->empty()) {
     return;
   }
@@ -1214,7 +1232,8 @@ void MobileScannerPlugin::DecodeFrame(const std::vector<uint8_t>& rgba,
 std::optional<std::string> MobileScannerPlugin::DecodeQr(
     const std::vector<uint8_t>& rgba,
     int width,
-    int height) {
+    int height,
+    bool include_full_frame_fallback) {
   if (rgba.empty() || width <= 0 || height <= 0) {
     return std::nullopt;
   }
@@ -1256,16 +1275,23 @@ std::optional<std::string> MobileScannerPlugin::DecodeQr(
 
   const ZXing::ImageView image(rgba.data(), width, height,
                                ZXing::ImageFormat::RGBA);
-  const ZXing::ImageView crop =
-      has_window ? image.cropped(left, top, crop_width, crop_height) : image;
-  const auto barcodes = ZXing::ReadBarcodes(crop, options);
-
-  for (const auto& barcode : barcodes) {
-    if (barcode.isValid()) {
-      return barcode.text();
-    }
+  if (!has_window) {
+    return ReadQrFromImage(image, options);
   }
-  return std::nullopt;
+
+  const ZXing::ImageView crop = image.cropped(left, top, crop_width,
+                                              crop_height);
+  if (const auto value = ReadQrFromImage(crop, options)) {
+    return value;
+  }
+
+  if (!include_full_frame_fallback ||
+      (left == 0 && top == 0 && crop_width == width &&
+       crop_height == height)) {
+    return std::nullopt;
+  }
+
+  return ReadQrFromImage(image, options);
 }
 
 const FlutterDesktopPixelBuffer* MobileScannerPlugin::CopyPixelBuffer(

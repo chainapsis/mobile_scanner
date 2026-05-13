@@ -98,7 +98,8 @@ class MobileScannerPlugin : public flutter::Plugin {
   void DecodeFrame(const std::vector<uint8_t>& rgba, int width, int height);
   std::optional<std::string> DecodeQr(const std::vector<uint8_t>& rgba,
                                       int width,
-                                      int height);
+                                      int height,
+                                      bool include_full_frame_fallback);
   const FlutterDesktopPixelBuffer* CopyPixelBuffer(size_t width,
                                                    size_t height);
 
@@ -146,6 +147,7 @@ class MobileScannerPlugin : public flutter::Plugin {
   std::string last_detected_value_;
   std::chrono::steady_clock::time_point last_detection_time_{};
   std::chrono::steady_clock::time_point last_decode_attempt_{};
+  uint32_t decode_attempt_count_ = 0;
 };
 
 }  // namespace mobile_scanner
