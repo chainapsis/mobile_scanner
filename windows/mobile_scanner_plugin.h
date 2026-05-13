@@ -76,7 +76,10 @@ class MobileScannerPlugin : public flutter::Plugin {
                         int height);
 
   std::vector<CameraDevice> EnumerateCameras();
-  bool OpenCamera(const CameraDevice& camera, int* width, int* height);
+  bool OpenCamera(const CameraDevice& camera,
+                  int* width,
+                  int* height,
+                  HRESULT* failure_result);
   void CaptureLoop();
   void CloseCamera();
   void StopCapture();

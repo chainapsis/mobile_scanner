@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <utility>
 
 namespace mobile_scanner {
@@ -92,6 +93,13 @@ std::wstring WideFromUtf8(const std::string& value) {
   MultiByteToWideChar(CP_UTF8, 0, value.data(),
                       static_cast<int>(value.size()), result.data(), size);
   return result;
+}
+
+std::string HResultMessage(HRESULT result) {
+  char buffer[16] = {};
+  std::snprintf(buffer, sizeof(buffer), "0x%08X",
+                static_cast<unsigned int>(result));
+  return buffer;
 }
 
 const flutter::EncodableMap* GetMap(
@@ -334,10 +342,18 @@ void MobileScannerPlugin::Start(
 
   int width = 0;
   int height = 0;
-  if (!OpenCamera(selected_camera, &width, &height)) {
-    result->Error(kPermissionDeniedError,
-                  "The camera could not be opened. Check Windows camera "
-                  "privacy settings and try again.");
+  HRESULT failure_result = S_OK;
+  if (!OpenCamera(selected_camera, &width, &height, &failure_result)) {
+    if (failure_result == E_ACCESSDENIED) {
+      result->Error(kPermissionDeniedError,
+                    "Camera access is blocked by Windows privacy settings. "
+                    "Turn on Camera access and Let desktop apps access your "
+                    "camera, then try again.");
+    } else {
+      result->Error(kGenericError,
+                    "The camera could not be opened. HRESULT " +
+                        HResultMessage(failure_result));
+    }
     return;
   }
 
@@ -499,26 +515,37 @@ MobileScannerPlugin::EnumerateCameras() {
 
 bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
                                      int* width,
-                                     int* height) {
+                                     int* height,
+                                     HRESULT* failure_result) {
+  auto fail = [failure_result](HRESULT result) {
+    if (failure_result != nullptr) {
+      *failure_result = result;
+    }
+    return false;
+  };
+
   CloseCamera();
 
   Microsoft::WRL::ComPtr<IMFAttributes> attributes;
-  if (FAILED(MFCreateAttributes(&attributes, 1))) {
-    return false;
+  HRESULT result = MFCreateAttributes(&attributes, 1);
+  if (FAILED(result)) {
+    return fail(result);
   }
-  if (FAILED(attributes->SetGUID(
-          MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-          MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))) {
-    return false;
+  result = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                               MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+  if (FAILED(result)) {
+    return fail(result);
   }
 
   IMFActivate** devices = nullptr;
   UINT32 count = 0;
-  if (FAILED(MFEnumDeviceSources(attributes.Get(), &devices, &count))) {
-    return false;
+  result = MFEnumDeviceSources(attributes.Get(), &devices, &count);
+  if (FAILED(result)) {
+    return fail(result);
   }
 
   Microsoft::WRL::ComPtr<IMFMediaSource> media_source;
+  HRESULT activate_result = E_FAIL;
   for (UINT32 i = 0; i < count; ++i) {
     WCHAR* symbolic_link = nullptr;
     UINT32 link_length = 0;
@@ -531,56 +558,61 @@ bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
     FreeAllocatedString(symbolic_link);
 
     if (link == camera.symbolic_link || camera.symbolic_link.empty()) {
-      devices[i]->ActivateObject(IID_PPV_ARGS(&media_source));
+      activate_result = devices[i]->ActivateObject(IID_PPV_ARGS(&media_source));
       break;
     }
   }
   ReleaseActivateArray(devices, count);
 
   if (!media_source) {
-    return false;
+    return fail(activate_result);
   }
 
   Microsoft::WRL::ComPtr<IMFAttributes> reader_attributes;
-  if (FAILED(MFCreateAttributes(&reader_attributes, 1))) {
-    return false;
+  result = MFCreateAttributes(&reader_attributes, 1);
+  if (FAILED(result)) {
+    return fail(result);
   }
   reader_attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
 
   Microsoft::WRL::ComPtr<IMFSourceReader> source_reader;
-  if (FAILED(MFCreateSourceReaderFromMediaSource(
-          media_source.Get(), reader_attributes.Get(), &source_reader))) {
-    return false;
+  result = MFCreateSourceReaderFromMediaSource(
+      media_source.Get(), reader_attributes.Get(), &source_reader);
+  if (FAILED(result)) {
+    return fail(result);
   }
 
   source_reader->SetStreamSelection(kAllStreams, FALSE);
   source_reader->SetStreamSelection(kFirstVideoStream, TRUE);
 
   Microsoft::WRL::ComPtr<IMFMediaType> output_type;
-  if (FAILED(MFCreateMediaType(&output_type))) {
-    return false;
+  result = MFCreateMediaType(&output_type);
+  if (FAILED(result)) {
+    return fail(result);
   }
   output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
   output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-  if (FAILED(source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
-                                                output_type.Get()))) {
-    return false;
+  result = source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
+                                              output_type.Get());
+  if (FAILED(result)) {
+    return fail(result);
   }
 
   Microsoft::WRL::ComPtr<IMFMediaType> current_type;
-  if (FAILED(
-          source_reader->GetCurrentMediaType(kFirstVideoStream, &current_type))) {
-    return false;
+  result = source_reader->GetCurrentMediaType(kFirstVideoStream, &current_type);
+  if (FAILED(result)) {
+    return fail(result);
   }
 
   UINT32 frame_width = 0;
   UINT32 frame_height = 0;
-  if (FAILED(MFGetAttributeSize(current_type.Get(), MF_MT_FRAME_SIZE,
-                                &frame_width, &frame_height))) {
-    return false;
+  result = MFGetAttributeSize(current_type.Get(), MF_MT_FRAME_SIZE,
+                              &frame_width, &frame_height);
+  if (FAILED(result)) {
+    return fail(result);
   }
   if (frame_width == 0 || frame_height == 0) {
-    return false;
+    return fail(E_FAIL);
   }
 
   {
