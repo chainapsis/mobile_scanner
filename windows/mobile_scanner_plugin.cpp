@@ -5,6 +5,7 @@
 #include <flutter/standard_method_codec.h>
 
 #include <mfapi.h>
+#include <mferror.h>
 #include <windows.h>
 
 #include <Barcode.h>
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <utility>
 
 namespace mobile_scanner {
@@ -180,6 +183,254 @@ double ClampUnit(double value) {
   return std::clamp(value, 0.0, 1.0);
 }
 
+uint8_t ClampByte(int value) {
+  return static_cast<uint8_t>(std::clamp(value, 0, 255));
+}
+
+bool GuidEquals(const GUID& lhs, const GUID& rhs) {
+  return IsEqualGUID(lhs, rhs);
+}
+
+std::optional<FrameFormat> FrameFormatFromSubtype(const GUID& subtype) {
+  if (GuidEquals(subtype, MFVideoFormat_RGB32) ||
+      GuidEquals(subtype, MFVideoFormat_ARGB32)) {
+    return FrameFormat::kBgra32;
+  }
+  if (GuidEquals(subtype, MFVideoFormat_RGB24)) {
+    return FrameFormat::kRgb24;
+  }
+  if (GuidEquals(subtype, MFVideoFormat_YUY2)) {
+    return FrameFormat::kYuy2;
+  }
+  if (GuidEquals(subtype, MFVideoFormat_NV12)) {
+    return FrameFormat::kNv12;
+  }
+  return std::nullopt;
+}
+
+LONG DefaultStride(FrameFormat format, UINT32 width) {
+  switch (format) {
+    case FrameFormat::kBgra32:
+      return static_cast<LONG>(width * 4);
+    case FrameFormat::kRgb24:
+      return static_cast<LONG>((width * 3 + 3) & ~3);
+    case FrameFormat::kYuy2:
+      return static_cast<LONG>(width * 2);
+    case FrameFormat::kNv12:
+      return static_cast<LONG>(width);
+  }
+  return static_cast<LONG>(width * 4);
+}
+
+int MinimumRowBytes(FrameFormat format, int width) {
+  switch (format) {
+    case FrameFormat::kBgra32:
+      return width * 4;
+    case FrameFormat::kRgb24:
+      return width * 3;
+    case FrameFormat::kYuy2:
+      return width * 2;
+    case FrameFormat::kNv12:
+      return width;
+  }
+  return width * 4;
+}
+
+LONG MediaTypeStride(IMFMediaType* media_type,
+                     FrameFormat format,
+                     UINT32 width) {
+  UINT32 stride = 0;
+  if (SUCCEEDED(media_type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) &&
+      stride != 0) {
+    return static_cast<LONG>(stride);
+  }
+  return DefaultStride(format, width);
+}
+
+int FormatRank(FrameFormat format) {
+  switch (format) {
+    case FrameFormat::kBgra32:
+      return 0;
+    case FrameFormat::kRgb24:
+      return 1;
+    case FrameFormat::kYuy2:
+      return 2;
+    case FrameFormat::kNv12:
+      return 3;
+  }
+  return 10;
+}
+
+void YuvToRgb(int y, int u, int v, uint8_t* out) {
+  const int c = y - 16;
+  const int d = u - 128;
+  const int e = v - 128;
+  out[0] = ClampByte((298 * c + 409 * e + 128) >> 8);
+  out[1] = ClampByte((298 * c - 100 * d - 208 * e + 128) >> 8);
+  out[2] = ClampByte((298 * c + 516 * d + 128) >> 8);
+  out[3] = 0xFF;
+}
+
+bool ReadSupportedVideoType(IMFMediaType* media_type,
+                            FrameFormat* format,
+                            UINT32* width,
+                            UINT32* height,
+                            LONG* stride) {
+  GUID major_type = {};
+  GUID subtype = {};
+  if (FAILED(media_type->GetGUID(MF_MT_MAJOR_TYPE, &major_type)) ||
+      !GuidEquals(major_type, MFMediaType_Video) ||
+      FAILED(media_type->GetGUID(MF_MT_SUBTYPE, &subtype))) {
+    return false;
+  }
+
+  const auto frame_format = FrameFormatFromSubtype(subtype);
+  if (!frame_format) {
+    return false;
+  }
+
+  UINT32 frame_width = 0;
+  UINT32 frame_height = 0;
+  if (FAILED(MFGetAttributeSize(media_type, MF_MT_FRAME_SIZE, &frame_width,
+                                &frame_height)) ||
+      frame_width == 0 || frame_height == 0) {
+    return false;
+  }
+
+  *format = *frame_format;
+  *width = frame_width;
+  *height = frame_height;
+  *stride = MediaTypeStride(media_type, *frame_format, frame_width);
+  return true;
+}
+
+struct NativeMediaTypeCandidate {
+  Microsoft::WRL::ComPtr<IMFMediaType> media_type;
+  FrameFormat format = FrameFormat::kBgra32;
+  UINT32 width = 0;
+  UINT32 height = 0;
+  LONG stride = 0;
+  int64_t score = std::numeric_limits<int64_t>::max();
+};
+
+int64_t NativeTypeScore(FrameFormat format, UINT32 width, UINT32 height) {
+  constexpr int64_t kTargetArea = 1280LL * 720LL;
+  constexpr int64_t kMinimumUsefulArea = 640LL * 480LL;
+  const int64_t area = static_cast<int64_t>(width) * height;
+  const int64_t area_delta =
+      area > kTargetArea ? area - kTargetArea : kTargetArea - area;
+  const int64_t low_resolution_penalty =
+      area < kMinimumUsefulArea ? kTargetArea : 0;
+  return static_cast<int64_t>(FormatRank(format)) * 100000 +
+         low_resolution_penalty + (area_delta / 1000);
+}
+
+HRESULT SetRgb32Output(
+    IMFSourceReader* source_reader,
+    Microsoft::WRL::ComPtr<IMFMediaType>* current_type) {
+  Microsoft::WRL::ComPtr<IMFMediaType> output_type;
+  HRESULT result = MFCreateMediaType(&output_type);
+  if (FAILED(result)) {
+    return result;
+  }
+  result = output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+  if (FAILED(result)) {
+    return result;
+  }
+  result = output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+  if (FAILED(result)) {
+    return result;
+  }
+  result = source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
+                                              output_type.Get());
+  if (FAILED(result)) {
+    return result;
+  }
+  return source_reader->GetCurrentMediaType(kFirstVideoStream,
+                                            current_type->ReleaseAndGetAddressOf());
+}
+
+bool SelectNativeMediaType(IMFSourceReader* source_reader,
+                           Microsoft::WRL::ComPtr<IMFMediaType>* current_type,
+                           FrameFormat* selected_format,
+                           UINT32* selected_width,
+                           UINT32* selected_height,
+                           LONG* selected_stride,
+                           HRESULT* failure_result) {
+  std::vector<NativeMediaTypeCandidate> candidates;
+  HRESULT last_result = MF_E_TOPO_CODEC_NOT_FOUND;
+
+  for (DWORD index = 0;; ++index) {
+    Microsoft::WRL::ComPtr<IMFMediaType> native_type;
+    const HRESULT result = source_reader->GetNativeMediaType(
+        kFirstVideoStream, index, &native_type);
+    if (result == MF_E_NO_MORE_TYPES) {
+      break;
+    }
+    if (FAILED(result)) {
+      last_result = result;
+      continue;
+    }
+
+    NativeMediaTypeCandidate candidate;
+    if (!ReadSupportedVideoType(native_type.Get(), &candidate.format,
+                                &candidate.width, &candidate.height,
+                                &candidate.stride)) {
+      continue;
+    }
+    candidate.media_type = native_type;
+    candidate.score =
+        NativeTypeScore(candidate.format, candidate.width, candidate.height);
+    candidates.push_back(std::move(candidate));
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.score < rhs.score;
+            });
+
+  for (const auto& candidate : candidates) {
+    const HRESULT set_result = source_reader->SetCurrentMediaType(
+        kFirstVideoStream, nullptr, candidate.media_type.Get());
+    if (FAILED(set_result)) {
+      last_result = set_result;
+      continue;
+    }
+
+    Microsoft::WRL::ComPtr<IMFMediaType> selected_type;
+    const HRESULT current_result = source_reader->GetCurrentMediaType(
+        kFirstVideoStream, &selected_type);
+    if (FAILED(current_result)) {
+      last_result = current_result;
+      continue;
+    }
+
+    FrameFormat format = FrameFormat::kBgra32;
+    UINT32 width = 0;
+    UINT32 height = 0;
+    LONG stride = 0;
+    if (!ReadSupportedVideoType(selected_type.Get(), &format, &width, &height,
+                                &stride)) {
+      format = candidate.format;
+      width = candidate.width;
+      height = candidate.height;
+      stride = candidate.stride;
+    }
+
+    *current_type = selected_type;
+    *selected_format = format;
+    *selected_width = width;
+    *selected_height = height;
+    *selected_stride = stride;
+    return true;
+  }
+
+  if (failure_result != nullptr) {
+    *failure_result = last_result;
+  }
+  return false;
+}
+
 void ReleaseActivateArray(IMFActivate** devices, UINT32 count) {
   if (devices == nullptr) {
     return;
@@ -342,17 +593,24 @@ void MobileScannerPlugin::Start(
 
   int width = 0;
   int height = 0;
+  int stride = 0;
+  FrameFormat format = FrameFormat::kBgra32;
   HRESULT failure_result = S_OK;
-  if (!OpenCamera(selected_camera, &width, &height, &failure_result)) {
+  std::string failure_step;
+  if (!OpenCamera(selected_camera, &width, &height, &stride, &format,
+                  &failure_result, &failure_step)) {
     if (failure_result == E_ACCESSDENIED) {
       result->Error(kPermissionDeniedError,
                     "Camera access is blocked by Windows privacy settings. "
                     "Turn on Camera access and Let desktop apps access your "
                     "camera, then try again.");
     } else {
-      result->Error(kGenericError,
-                    "The camera could not be opened. HRESULT " +
-                        HResultMessage(failure_result));
+      std::string message = "The camera could not be opened";
+      if (!failure_step.empty()) {
+        message += " while " + failure_step;
+      }
+      message += ". HRESULT " + HResultMessage(failure_result);
+      result->Error(kGenericError, message);
     }
     return;
   }
@@ -361,6 +619,8 @@ void MobileScannerPlugin::Start(
     std::lock_guard<std::mutex> lock(texture_mutex_);
     frame_width_ = width;
     frame_height_ = height;
+    frame_stride_ = stride;
+    frame_format_ = format;
     latest_frame_rgba_.clear();
     texture_ = std::make_unique<flutter::TextureVariant>(
         flutter::PixelBufferTexture([this](size_t requested_width,
@@ -516,10 +776,17 @@ MobileScannerPlugin::EnumerateCameras() {
 bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
                                      int* width,
                                      int* height,
-                                     HRESULT* failure_result) {
-  auto fail = [failure_result](HRESULT result) {
+                                     int* stride,
+                                     FrameFormat* format,
+                                     HRESULT* failure_result,
+                                     std::string* failure_step) {
+  auto fail = [failure_result, failure_step](HRESULT result,
+                                             const char* step) {
     if (failure_result != nullptr) {
       *failure_result = result;
+    }
+    if (failure_step != nullptr) {
+      *failure_step = step;
     }
     return false;
   };
@@ -529,19 +796,19 @@ bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
   Microsoft::WRL::ComPtr<IMFAttributes> attributes;
   HRESULT result = MFCreateAttributes(&attributes, 1);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "creating camera attributes");
   }
   result = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "configuring camera enumeration");
   }
 
   IMFActivate** devices = nullptr;
   UINT32 count = 0;
   result = MFEnumDeviceSources(attributes.Get(), &devices, &count);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "enumerating camera devices");
   }
 
   Microsoft::WRL::ComPtr<IMFMediaSource> media_source;
@@ -565,54 +832,65 @@ bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
   ReleaseActivateArray(devices, count);
 
   if (!media_source) {
-    return fail(activate_result);
+    return fail(activate_result, "activating the camera");
   }
 
   Microsoft::WRL::ComPtr<IMFAttributes> reader_attributes;
-  result = MFCreateAttributes(&reader_attributes, 1);
+  result = MFCreateAttributes(&reader_attributes, 2);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "creating camera reader attributes");
   }
-  reader_attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+  result = reader_attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                                        TRUE);
+  if (FAILED(result)) {
+    return fail(result, "enabling camera hardware transforms");
+  }
+  result = reader_attributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+                                        TRUE);
+  if (FAILED(result)) {
+    return fail(result, "enabling camera video processing");
+  }
 
   Microsoft::WRL::ComPtr<IMFSourceReader> source_reader;
   result = MFCreateSourceReaderFromMediaSource(
       media_source.Get(), reader_attributes.Get(), &source_reader);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "creating the camera reader");
   }
 
-  source_reader->SetStreamSelection(kAllStreams, FALSE);
-  source_reader->SetStreamSelection(kFirstVideoStream, TRUE);
-
-  Microsoft::WRL::ComPtr<IMFMediaType> output_type;
-  result = MFCreateMediaType(&output_type);
+  result = source_reader->SetStreamSelection(kAllStreams, FALSE);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "configuring camera streams");
   }
-  output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-  result = source_reader->SetCurrentMediaType(kFirstVideoStream, nullptr,
-                                              output_type.Get());
+  result = source_reader->SetStreamSelection(kFirstVideoStream, TRUE);
   if (FAILED(result)) {
-    return fail(result);
+    return fail(result, "selecting the camera video stream");
   }
 
   Microsoft::WRL::ComPtr<IMFMediaType> current_type;
-  result = source_reader->GetCurrentMediaType(kFirstVideoStream, &current_type);
-  if (FAILED(result)) {
-    return fail(result);
-  }
-
+  FrameFormat selected_format = FrameFormat::kBgra32;
   UINT32 frame_width = 0;
   UINT32 frame_height = 0;
-  result = MFGetAttributeSize(current_type.Get(), MF_MT_FRAME_SIZE,
-                              &frame_width, &frame_height);
-  if (FAILED(result)) {
-    return fail(result);
+  LONG selected_stride = 0;
+
+  result = SetRgb32Output(source_reader.Get(), &current_type);
+  if (SUCCEEDED(result)) {
+    if (!ReadSupportedVideoType(current_type.Get(), &selected_format,
+                                &frame_width, &frame_height,
+                                &selected_stride)) {
+      return fail(E_FAIL, "reading the camera RGB32 output format");
+    }
+  } else {
+    HRESULT native_result = result;
+    if (!SelectNativeMediaType(source_reader.Get(), &current_type,
+                               &selected_format, &frame_width, &frame_height,
+                               &selected_stride, &native_result)) {
+      return fail(native_result, "selecting a supported camera video format");
+    }
   }
-  if (frame_width == 0 || frame_height == 0) {
-    return fail(E_FAIL);
+
+  if (frame_width == 0 || frame_height == 0 || selected_stride == 0) {
+    return fail(E_FAIL, "reading the camera frame format");
   }
 
   {
@@ -623,6 +901,8 @@ bool MobileScannerPlugin::OpenCamera(const CameraDevice& camera,
 
   *width = static_cast<int>(frame_width);
   *height = static_cast<int>(frame_height);
+  *stride = static_cast<int>(selected_stride);
+  *format = selected_format;
   return true;
 }
 
@@ -717,6 +997,8 @@ void MobileScannerPlugin::StopCapture() {
     latest_frame_rgba_.clear();
     frame_width_ = 0;
     frame_height_ = 0;
+    frame_stride_ = 0;
+    frame_format_ = FrameFormat::kBgra32;
     if (texture_id_ >= 0) {
       texture_registrar_->UnregisterTexture(texture_id_);
       texture_id_ = -1;
@@ -737,30 +1019,92 @@ void MobileScannerPlugin::StopCapture() {
 void MobileScannerPlugin::StoreFrame(const uint8_t* data, size_t length) {
   int width = 0;
   int height = 0;
+  int stride = 0;
+  FrameFormat format = FrameFormat::kBgra32;
   {
     std::lock_guard<std::mutex> lock(texture_mutex_);
     width = frame_width_;
     height = frame_height_;
+    stride = frame_stride_;
+    format = frame_format_;
   }
 
-  if (data == nullptr || width <= 0 || height <= 0) {
+  if (data == nullptr || width <= 0 || height <= 0 || stride == 0) {
     return;
   }
 
   const size_t pixel_count =
       static_cast<size_t>(width) * static_cast<size_t>(height);
   const size_t expected_length = pixel_count * 4;
-  if (length < expected_length) {
-    return;
-  }
-
   std::vector<uint8_t> rgba(expected_length);
-  for (size_t i = 0; i < pixel_count; ++i) {
-    const size_t offset = i * 4;
-    rgba[offset] = data[offset + 2];
-    rgba[offset + 1] = data[offset + 1];
-    rgba[offset + 2] = data[offset];
-    rgba[offset + 3] = 0xFF;
+  const int absolute_stride = std::abs(stride);
+
+  if (format == FrameFormat::kNv12) {
+    const size_t y_plane_size =
+        static_cast<size_t>(absolute_stride) * static_cast<size_t>(height);
+    const size_t uv_plane_size =
+        static_cast<size_t>(absolute_stride) *
+        static_cast<size_t>((height + 1) / 2);
+    if (length < y_plane_size + uv_plane_size ||
+        absolute_stride < MinimumRowBytes(format, width)) {
+      return;
+    }
+
+    const uint8_t* y_plane = data;
+    const uint8_t* uv_plane = data + y_plane_size;
+    for (int y = 0; y < height; ++y) {
+      const uint8_t* y_row = y_plane + static_cast<size_t>(y) * absolute_stride;
+      const uint8_t* uv_row =
+          uv_plane + static_cast<size_t>(y / 2) * absolute_stride;
+      for (int x = 0; x < width; ++x) {
+        const int uv_x =
+            std::min((x / 2) * 2, std::max(0, absolute_stride - 2));
+        const size_t out = (static_cast<size_t>(y) * width + x) * 4;
+        YuvToRgb(y_row[x], uv_row[uv_x], uv_row[uv_x + 1], &rgba[out]);
+      }
+    }
+  } else {
+    const size_t required_length =
+        static_cast<size_t>(absolute_stride) * static_cast<size_t>(height);
+    if (length < required_length ||
+        absolute_stride < MinimumRowBytes(format, width)) {
+      return;
+    }
+
+    for (int y = 0; y < height; ++y) {
+      const int source_y = stride > 0 ? y : height - 1 - y;
+      const uint8_t* row =
+          data + static_cast<size_t>(source_y) * absolute_stride;
+      for (int x = 0; x < width; ++x) {
+        const size_t out = (static_cast<size_t>(y) * width + x) * 4;
+        switch (format) {
+          case FrameFormat::kBgra32: {
+            const uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+            rgba[out] = pixel[2];
+            rgba[out + 1] = pixel[1];
+            rgba[out + 2] = pixel[0];
+            rgba[out + 3] = 0xFF;
+            break;
+          }
+          case FrameFormat::kRgb24: {
+            const uint8_t* pixel = row + static_cast<size_t>(x) * 3;
+            rgba[out] = pixel[2];
+            rgba[out + 1] = pixel[1];
+            rgba[out + 2] = pixel[0];
+            rgba[out + 3] = 0xFF;
+            break;
+          }
+          case FrameFormat::kYuy2: {
+            const uint8_t* pair = row + static_cast<size_t>(x / 2) * 4;
+            const bool second = (x % 2) == 1;
+            YuvToRgb(pair[second ? 2 : 0], pair[1], pair[3], &rgba[out]);
+            break;
+          }
+          case FrameFormat::kNv12:
+            break;
+        }
+      }
+    }
   }
 
   {

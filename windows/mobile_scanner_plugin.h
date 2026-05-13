@@ -24,6 +24,13 @@
 
 namespace mobile_scanner {
 
+enum class FrameFormat {
+  kBgra32,
+  kRgb24,
+  kYuy2,
+  kNv12,
+};
+
 class MobileScannerPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
@@ -79,7 +86,10 @@ class MobileScannerPlugin : public flutter::Plugin {
   bool OpenCamera(const CameraDevice& camera,
                   int* width,
                   int* height,
-                  HRESULT* failure_result);
+                  int* stride,
+                  FrameFormat* format,
+                  HRESULT* failure_result,
+                  std::string* failure_step);
   void CaptureLoop();
   void CloseCamera();
   void StopCapture();
@@ -115,6 +125,8 @@ class MobileScannerPlugin : public flutter::Plugin {
   std::vector<uint8_t> latest_frame_rgba_;
   int frame_width_ = 0;
   int frame_height_ = 0;
+  int frame_stride_ = 0;
+  FrameFormat frame_format_ = FrameFormat::kBgra32;
   int64_t texture_id_ = -1;
 
   std::mutex camera_mutex_;
