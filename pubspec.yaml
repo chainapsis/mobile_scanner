@@ -42,6 +42,8 @@ flutter:
       macos:
         pluginClass: MobileScannerPlugin
         sharedDarwinSource: true
+      linux:
+        pluginClass: MobileScannerPlugin
       windows:
         pluginClass: MobileScannerPluginCApi
       web:
