@@ -5,6 +5,9 @@ project(${PROJECT_NAME} LANGUAGES CXX)
 
 set(PLUGIN_NAME "mobile_scanner_plugin")
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GIO_UNIX REQUIRED IMPORTED_TARGET gio-unix-2.0)
+
 option(
   MOBILE_SCANNER_USE_SYSTEM_ZXING
   "Use a system-installed ZXing package instead of building the bundled source"
@@ -70,6 +73,7 @@ target_include_directories(${PLUGIN_NAME} PRIVATE
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   PkgConfig::GTK
+  PkgConfig::GIO_UNIX
   ZXing::ZXing
   dl)
 

@@ -1,7 +1,10 @@
 #include "include/mobile_scanner/mobile_scanner_plugin.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 
+#include <gio/gio.h>
+#include <gio/gunixfdlist.h>
 #include <Barcode.h>
 #include <BarcodeFormat.h>
 #include <ImageView.h>
@@ -40,9 +43,17 @@ constexpr char kUnsupportedOperationError[] =
     "MOBILE_SCANNER_UNSUPPORTED_OPERATION";
 constexpr char kAlreadyStartedError[] = "MOBILE_SCANNER_ALREADY_STARTED_ERROR";
 constexpr char kNoCameraError[] = "MOBILE_SCANNER_NO_CAMERA_ERROR";
+constexpr char kPermissionDeniedError[] =
+    "MOBILE_SCANNER_CAMERA_PERMISSION_DENIED";
 constexpr char kGenericError[] = "MOBILE_SCANNER_GENERIC_ERROR";
+constexpr char kPortalBusName[] = "org.freedesktop.portal.Desktop";
+constexpr char kPortalObjectPath[] = "/org/freedesktop/portal/desktop";
+constexpr char kPortalCameraInterface[] = "org.freedesktop.portal.Camera";
+constexpr char kPortalRequestInterface[] = "org.freedesktop.portal.Request";
 
+constexpr int kAuthorizationUndetermined = 0;
 constexpr int kAuthorizationAuthorized = 1;
+constexpr int kAuthorizationDenied = 2;
 constexpr int kTorchUnavailable = -1;
 constexpr int kCameraFacingExternal = 2;
 constexpr int kCameraFacingUnknown = -1;
@@ -304,6 +315,9 @@ struct MobileScannerPluginState {
   int frame_width = 0;
   int frame_height = 0;
 
+  bool portal_permission_granted = false;
+  bool portal_permission_denied = false;
+
   std::mutex scan_window_mutex;
   std::optional<ScanWindow> scan_window;
 
@@ -327,24 +341,358 @@ G_DEFINE_TYPE(MobileScannerPlugin, mobile_scanner_plugin, g_object_get_type())
 
 namespace {
 
+bool IsFlatpakSandbox() {
+  return g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS);
+}
+
+bool ForcePortalBackend() {
+  const char* value = g_getenv("MOBILE_SCANNER_FORCE_CAMERA_PORTAL");
+  return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+bool ShouldUsePortalBackend() {
+  return IsFlatpakSandbox() || ForcePortalBackend();
+}
+
+std::string PortalErrorMessage(GError* error,
+                               const char* fallback) {
+  if (error != nullptr && error->message != nullptr) {
+    return error->message;
+  }
+  return fallback;
+}
+
+GDBusConnection* OpenSessionBus(std::string* error_message) {
+  g_autoptr(GError) error = nullptr;
+  GDBusConnection* connection =
+      g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+  if (connection == nullptr && error_message != nullptr) {
+    *error_message =
+        PortalErrorMessage(error, "Could not connect to the session bus.");
+  }
+  return connection;
+}
+
+std::string PortalRequestToken() {
+  return "mobile_scanner_" + std::to_string(g_random_int());
+}
+
+std::string PortalSenderName(GDBusConnection* connection) {
+  const char* unique_name = g_dbus_connection_get_unique_name(connection);
+  if (unique_name == nullptr) {
+    return std::string();
+  }
+
+  std::string sender = unique_name;
+  if (!sender.empty() && sender.front() == ':') {
+    sender.erase(sender.begin());
+  }
+  std::replace(sender.begin(), sender.end(), '.', '_');
+  return sender;
+}
+
+std::string ExpectedPortalRequestPath(GDBusConnection* connection,
+                                      const std::string& token) {
+  const std::string sender = PortalSenderName(connection);
+  if (sender.empty()) {
+    return std::string();
+  }
+  return std::string(kPortalObjectPath) + "/request/" + sender + "/" + token;
+}
+
+bool PortalCameraInterfaceAvailable() {
+  std::string error_message;
+  g_autoptr(GDBusConnection) connection = OpenSessionBus(&error_message);
+  if (connection == nullptr) {
+    return false;
+  }
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GVariant) result = g_dbus_connection_call_sync(
+      connection, kPortalBusName, kPortalObjectPath,
+      "org.freedesktop.DBus.Properties", "Get",
+      g_variant_new("(ss)", kPortalCameraInterface, "version"),
+      G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, &error);
+  return result != nullptr;
+}
+
+bool PortalCameraPresent() {
+  std::string error_message;
+  g_autoptr(GDBusConnection) connection = OpenSessionBus(&error_message);
+  if (connection == nullptr) {
+    return false;
+  }
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GVariant) result = g_dbus_connection_call_sync(
+      connection, kPortalBusName, kPortalObjectPath,
+      "org.freedesktop.DBus.Properties", "Get",
+      g_variant_new("(ss)", kPortalCameraInterface, "IsCameraPresent"),
+      G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, &error);
+  if (result == nullptr) {
+    return false;
+  }
+
+  g_autoptr(GVariant) value = nullptr;
+  g_variant_get(result, "(@v)", &value);
+  g_autoptr(GVariant) unboxed = g_variant_get_variant(value);
+  return g_variant_is_of_type(unboxed, G_VARIANT_TYPE_BOOLEAN) &&
+         g_variant_get_boolean(unboxed);
+}
+
+struct PortalRequestWait {
+  GMainLoop* loop = nullptr;
+  guint timeout_id = 0;
+  bool completed = false;
+  guint32 response = 2;
+};
+
+gboolean PortalRequestTimeout(gpointer user_data) {
+  auto* wait = static_cast<PortalRequestWait*>(user_data);
+  wait->timeout_id = 0;
+  if (!wait->completed && wait->loop != nullptr) {
+    g_main_loop_quit(wait->loop);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void PortalRequestResponse(GDBusConnection* connection,
+                           const gchar* sender_name,
+                           const gchar* object_path,
+                           const gchar* interface_name,
+                           const gchar* signal_name,
+                           GVariant* parameters,
+                           gpointer user_data) {
+  auto* wait = static_cast<PortalRequestWait*>(user_data);
+  guint32 response = 2;
+  g_autoptr(GVariant) results = nullptr;
+  g_variant_get(parameters, "(u@a{sv})", &response, &results);
+
+  wait->response = response;
+  wait->completed = true;
+  if (wait->loop != nullptr) {
+    g_main_loop_quit(wait->loop);
+  }
+}
+
+bool RequestPortalCameraAccess(std::string* error_message) {
+  g_autoptr(GDBusConnection) connection = OpenSessionBus(error_message);
+  if (connection == nullptr) {
+    return false;
+  }
+
+  const std::string token = PortalRequestToken();
+  const std::string expected_path =
+      ExpectedPortalRequestPath(connection, token);
+
+  PortalRequestWait wait;
+  wait.loop = g_main_loop_new(nullptr, FALSE);
+
+  guint subscription_id = 0;
+  if (!expected_path.empty()) {
+    subscription_id = g_dbus_connection_signal_subscribe(
+        connection, kPortalBusName, kPortalRequestInterface, "Response",
+        expected_path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+        PortalRequestResponse, &wait, nullptr);
+  }
+
+  GVariantBuilder options;
+  g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+  g_variant_builder_add(&options, "{sv}", "handle_token",
+                        g_variant_new_string(token.c_str()));
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GVariant) result = g_dbus_connection_call_sync(
+      connection, kPortalBusName, kPortalObjectPath, kPortalCameraInterface,
+      "AccessCamera", g_variant_new("(a{sv})", &options), G_VARIANT_TYPE("(o)"),
+      G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
+  if (result == nullptr) {
+    if (subscription_id != 0) {
+      g_dbus_connection_signal_unsubscribe(connection, subscription_id);
+    }
+    g_main_loop_unref(wait.loop);
+    if (error_message != nullptr) {
+      *error_message =
+          PortalErrorMessage(error, "Could not request camera access.");
+    }
+    return false;
+  }
+
+  const gchar* returned_path = nullptr;
+  g_variant_get(result, "(&o)", &returned_path);
+  if (returned_path != nullptr && expected_path != returned_path) {
+    if (subscription_id != 0) {
+      g_dbus_connection_signal_unsubscribe(connection, subscription_id);
+    }
+    subscription_id = g_dbus_connection_signal_subscribe(
+        connection, kPortalBusName, kPortalRequestInterface, "Response",
+        returned_path, nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+        PortalRequestResponse, &wait, nullptr);
+  }
+
+  wait.timeout_id = g_timeout_add_seconds(60, PortalRequestTimeout, &wait);
+  g_main_loop_run(wait.loop);
+  if (wait.timeout_id != 0) {
+    g_source_remove(wait.timeout_id);
+  }
+  if (subscription_id != 0) {
+    g_dbus_connection_signal_unsubscribe(connection, subscription_id);
+  }
+  g_main_loop_unref(wait.loop);
+
+  if (!wait.completed) {
+    if (error_message != nullptr) {
+      *error_message = "Timed out waiting for the camera permission response.";
+    }
+    return false;
+  }
+
+  if (wait.response != 0) {
+    if (error_message != nullptr) {
+      *error_message = "Camera permission denied.";
+    }
+    return false;
+  }
+
+  return true;
+}
+
+int OpenPortalPipeWireRemote(std::string* error_message) {
+  g_autoptr(GDBusConnection) connection = OpenSessionBus(error_message);
+  if (connection == nullptr) {
+    return -1;
+  }
+
+  GVariantBuilder options;
+  g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GUnixFDList) fd_list = nullptr;
+  g_autoptr(GVariant) result = g_dbus_connection_call_with_unix_fd_list_sync(
+      connection, kPortalBusName, kPortalObjectPath, kPortalCameraInterface,
+      "OpenPipeWireRemote", g_variant_new("(a{sv})", &options),
+      G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &fd_list,
+      nullptr, &error);
+  if (result == nullptr || fd_list == nullptr) {
+    if (error_message != nullptr) {
+      *error_message =
+          PortalErrorMessage(error, "Could not open the PipeWire camera remote.");
+    }
+    return -1;
+  }
+
+  gint fd_index = -1;
+  g_variant_get(result, "(h)", &fd_index);
+  if (fd_index < 0) {
+    if (error_message != nullptr) {
+      *error_message = "The PipeWire camera remote did not return a valid fd.";
+    }
+    return -1;
+  }
+
+  g_autoptr(GError) fd_error = nullptr;
+  const int fd = g_unix_fd_list_get(fd_list, fd_index, &fd_error);
+  if (fd < 0 && error_message != nullptr) {
+    *error_message =
+        PortalErrorMessage(fd_error, "Could not read the PipeWire camera fd.");
+  }
+  return fd;
+}
+
+int CameraAuthorizationState(MobileScannerPluginState* state) {
+  if (!ShouldUsePortalBackend()) {
+    return kAuthorizationAuthorized;
+  }
+  if (state->portal_permission_granted) {
+    return kAuthorizationAuthorized;
+  }
+  if (state->portal_permission_denied) {
+    return kAuthorizationDenied;
+  }
+  return kAuthorizationUndetermined;
+}
+
+bool RequestCameraAuthorization(MobileScannerPluginState* state,
+                                std::string* error_message) {
+  if (!ShouldUsePortalBackend()) {
+    state->portal_permission_granted = true;
+    state->portal_permission_denied = false;
+    return true;
+  }
+
+  if (!PortalCameraInterfaceAvailable()) {
+    state->portal_permission_granted = false;
+    state->portal_permission_denied = true;
+    if (error_message != nullptr) {
+      *error_message = "Camera portal is not available.";
+    }
+    return false;
+  }
+
+  if (!PortalCameraPresent()) {
+    state->portal_permission_granted = false;
+    state->portal_permission_denied = true;
+    if (error_message != nullptr) {
+      *error_message = "No camera found.";
+    }
+    return false;
+  }
+
+  const bool granted = RequestPortalCameraAccess(error_message);
+  state->portal_permission_granted = granted;
+  state->portal_permission_denied = !granted;
+  return granted;
+}
+
 std::vector<CameraDevice> EnumerateCameras(GstApi* api) {
   if (api == nullptr) {
     return {};
   }
+  if (ShouldUsePortalBackend() && !PortalCameraPresent()) {
+    return {};
+  }
   CameraDevice camera;
   camera.id = "0";
-  camera.name = "Default camera";
+  camera.name = ShouldUsePortalBackend() ? "Portal camera" : "Default camera";
   camera.is_default = true;
   return {camera};
 }
 
 GstElement* CreateCameraSource(GstApi* api,
+                               MobileScannerPluginState* state,
                                const std::string& requested_id,
-                               CameraDevice* selected_camera) {
+                               CameraDevice* selected_camera,
+                               std::string* error_message) {
   selected_camera->id = requested_id.empty() ? "0" : requested_id;
-  selected_camera->name = "Default camera";
+  selected_camera->name = ShouldUsePortalBackend() ? "Portal camera"
+                                                   : "Default camera";
   selected_camera->is_default = true;
-  return api->element_factory_make("autovideosrc", nullptr);
+
+  if (!ShouldUsePortalBackend()) {
+    return api->element_factory_make("autovideosrc", nullptr);
+  }
+
+  if (!state->portal_permission_granted &&
+      !RequestCameraAuthorization(state, error_message)) {
+    return nullptr;
+  }
+
+  const int fd = OpenPortalPipeWireRemote(error_message);
+  if (fd < 0) {
+    return nullptr;
+  }
+
+  GstElement* source = api->element_factory_make("pipewiresrc", nullptr);
+  if (source == nullptr) {
+    close(fd);
+    if (error_message != nullptr) {
+      *error_message = "The GStreamer pipewiresrc element is not available.";
+    }
+    return nullptr;
+  }
+
+  g_object_set(source, "fd", fd, nullptr);
+  return source;
 }
 
 FlValue* CameraToValue(const CameraDevice& camera) {
@@ -928,11 +1276,19 @@ FlMethodResponse* Start(MobileScannerPlugin* self, FlValue* arguments) {
   const std::string requested_camera_id =
       GetString(arguments, "cameraId", std::string());
   CameraDevice selected_camera;
-  GstElement* source = CreateCameraSource(api, requested_camera_id,
-                                          &selected_camera);
+  std::string source_error;
+  GstElement* source = CreateCameraSource(api, state, requested_camera_id,
+                                          &selected_camera, &source_error);
   if (source == nullptr) {
+    const bool permission_denied = state->portal_permission_denied &&
+                                   source_error == "Camera permission denied.";
+    const char* error_code =
+        permission_denied ? kPermissionDeniedError : kNoCameraError;
+    const std::string message =
+        source_error.empty() ? "The selected camera could not be opened."
+                             : source_error;
     return FL_METHOD_RESPONSE(fl_method_error_response_new(
-        kNoCameraError, "The selected camera could not be opened.", nullptr));
+        error_code, message.c_str(), nullptr));
   }
 
   GstElement* pipeline = api->pipeline_new("mobile_scanner_pipeline");
@@ -1109,11 +1465,13 @@ void HandleMethodCall(MobileScannerPlugin* self, FlMethodCall* method_call) {
   FlValue* arguments = fl_method_call_get_args(method_call);
 
   if (strcmp(method, "state") == 0) {
-    response = FL_METHOD_RESPONSE(
-        fl_method_success_response_new(fl_value_new_int(kAuthorizationAuthorized)));
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(
+        fl_value_new_int(CameraAuthorizationState(self->state))));
   } else if (strcmp(method, "request") == 0) {
+    std::string error_message;
+    const bool granted = RequestCameraAuthorization(self->state, &error_message);
     response = FL_METHOD_RESPONSE(
-        fl_method_success_response_new(fl_value_new_bool(true)));
+        fl_method_success_response_new(fl_value_new_bool(granted)));
   } else if (strcmp(method, "start") == 0) {
     response = Start(self, arguments);
   } else if (strcmp(method, "stop") == 0) {
