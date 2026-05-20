@@ -57,6 +57,7 @@ constexpr int kGstStateNull = 1;
 constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
 constexpr uint64_t kGstMillisecond = 1000000;
+constexpr bool kMirrorPreviewHorizontally = true;
 
 struct _GstElement;
 struct _GstCaps;
@@ -434,6 +435,35 @@ double ClampUnit(double value) {
   return std::clamp(value, 0.0, 1.0);
 }
 
+std::vector<uint8_t> MirrorRgbaHorizontally(const std::vector<uint8_t>& rgba,
+                                            int width,
+                                            int height) {
+  if (rgba.empty() || width <= 1 || height <= 0) {
+    return rgba;
+  }
+
+  const size_t row_bytes = static_cast<size_t>(width) * 4;
+  const size_t required = row_bytes * static_cast<size_t>(height);
+  if (rgba.size() < required) {
+    return rgba;
+  }
+
+  std::vector<uint8_t> mirrored(required);
+  for (int y = 0; y < height; ++y) {
+    const uint8_t* source_row = rgba.data() + static_cast<size_t>(y) * row_bytes;
+    uint8_t* destination_row =
+        mirrored.data() + static_cast<size_t>(y) * row_bytes;
+
+    for (int x = 0; x < width; ++x) {
+      const uint8_t* source_pixel =
+          source_row + static_cast<size_t>(width - 1 - x) * 4;
+      uint8_t* destination_pixel = destination_row + static_cast<size_t>(x) * 4;
+      std::memcpy(destination_pixel, source_pixel, 4);
+    }
+  }
+  return mirrored;
+}
+
 std::optional<std::string> ReadQrFromImage(
     const ZXing::ImageView& image,
     const ZXing::ReaderOptions& options) {
@@ -605,12 +635,17 @@ std::optional<std::string> DecodeQr(MobileScannerPluginState* state,
   int crop_width = width;
   int crop_height = height;
   if (has_window) {
-    left = std::clamp(static_cast<int>(std::lround(window.left * width)), 0,
+    const double source_left =
+        kMirrorPreviewHorizontally ? 1.0 - window.right : window.left;
+    const double source_right =
+        kMirrorPreviewHorizontally ? 1.0 - window.left : window.right;
+
+    left = std::clamp(static_cast<int>(std::lround(source_left * width)), 0,
                       std::max(width - 1, 0));
     top = std::clamp(static_cast<int>(std::lround(window.top * height)), 0,
                      std::max(height - 1, 0));
     const int right =
-        std::clamp(static_cast<int>(std::lround(window.right * width)),
+        std::clamp(static_cast<int>(std::lround(source_right * width)),
                    left + 1, width);
     const int bottom =
         std::clamp(static_cast<int>(std::lround(window.bottom * height)),
@@ -733,8 +768,11 @@ bool ProcessSample(MobileScannerPluginState* state,
                             static_cast<uint8_t*>(copied_data) + required);
   g_free(copied_data);
 
+  const std::vector<uint8_t> preview =
+      kMirrorPreviewHorizontally ? MirrorRgbaHorizontally(rgba, width, height)
+                                 : rgba;
   mobile_scanner_frame_texture_set_frame(
-      state->texture, rgba, static_cast<uint32_t>(width),
+      state->texture, preview, static_cast<uint32_t>(width),
       static_cast<uint32_t>(height));
 
   {
