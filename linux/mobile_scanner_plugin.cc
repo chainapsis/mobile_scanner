@@ -1,6 +1,7 @@
 #include "include/mobile_scanner/mobile_scanner_plugin.h"
 
 #include <dlfcn.h>
+#include <dirent.h>
 #include <unistd.h>
 
 #include <gio/gio.h>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -354,6 +356,56 @@ bool ShouldUsePortalBackend() {
   return IsFlatpakSandbox() || ForcePortalBackend();
 }
 
+bool IsV4l2DeviceName(const char* name) {
+  if (name == nullptr || std::strncmp(name, "video", 5) != 0) {
+    return false;
+  }
+  const char* cursor = name + 5;
+  if (*cursor == '\0') {
+    return false;
+  }
+  while (*cursor != '\0') {
+    if (*cursor < '0' || *cursor > '9') {
+      return false;
+    }
+    ++cursor;
+  }
+  return true;
+}
+
+int V4l2DeviceIndex(const std::string& path) {
+  const std::string prefix = "/dev/video";
+  if (path.rfind(prefix, 0) != 0) {
+    return 0;
+  }
+  return std::atoi(path.c_str() + prefix.size());
+}
+
+std::vector<std::string> EnumerateV4l2DevicePaths() {
+  std::vector<std::string> devices;
+  DIR* dir = opendir("/dev");
+  if (dir == nullptr) {
+    return devices;
+  }
+
+  while (dirent* entry = readdir(dir)) {
+    if (!IsV4l2DeviceName(entry->d_name)) {
+      continue;
+    }
+    std::string path = std::string("/dev/") + entry->d_name;
+    if (access(path.c_str(), R_OK | W_OK) == 0) {
+      devices.push_back(path);
+    }
+  }
+  closedir(dir);
+
+  std::sort(devices.begin(), devices.end(),
+            [](const std::string& left, const std::string& right) {
+              return V4l2DeviceIndex(left) < V4l2DeviceIndex(right);
+            });
+  return devices;
+}
+
 std::string PortalErrorMessage(GError* error,
                                const char* fallback) {
   if (error != nullptr && error->message != nullptr) {
@@ -648,6 +700,18 @@ std::vector<CameraDevice> EnumerateCameras(GstApi* api) {
   if (api == nullptr) {
     return {};
   }
+  if (!ShouldUsePortalBackend()) {
+    std::vector<CameraDevice> cameras;
+    const auto devices = EnumerateV4l2DevicePaths();
+    for (size_t i = 0; i < devices.size(); ++i) {
+      CameraDevice camera;
+      camera.id = devices[i];
+      camera.name = i == 0 ? "Default camera" : devices[i];
+      camera.is_default = i == 0;
+      cameras.push_back(camera);
+    }
+    return cameras;
+  }
   if (ShouldUsePortalBackend() && !PortalCameraPresent()) {
     return {};
   }
@@ -669,7 +733,34 @@ GstElement* CreateCameraSource(GstApi* api,
   selected_camera->is_default = true;
 
   if (!ShouldUsePortalBackend()) {
-    return api->element_factory_make("autovideosrc", nullptr);
+    const auto devices = EnumerateV4l2DevicePaths();
+    std::string device = requested_id;
+    if (device.empty() || device == "0") {
+      if (!devices.empty()) {
+        device = devices.front();
+      }
+    }
+    if (device.empty()) {
+      if (error_message != nullptr) {
+        *error_message = "No camera found.";
+      }
+      return nullptr;
+    }
+
+    GstElement* source = api->element_factory_make("v4l2src", nullptr);
+    if (source == nullptr) {
+      if (error_message != nullptr) {
+        *error_message = "The GStreamer v4l2src element is not available.";
+      }
+      return nullptr;
+    }
+
+    g_object_set(source, "device", device.c_str(), nullptr);
+    selected_camera->id = device;
+    selected_camera->name =
+        !devices.empty() && device == devices.front() ? "Default camera"
+                                                      : device;
+    return source;
   }
 
   if (!state->portal_permission_granted &&
