@@ -97,6 +97,10 @@ class MobileScanner(
             } catch (_: IllegalStateException) {
                 // The ProcessCameraProvider was already configured.
                 // Do nothing.
+            } catch (_: RuntimeException) {
+                // CameraX process-provider logging configuration is best-effort.
+                // Local JVM tests do not provide every Android framework class
+                // used by Camera2Config.defaultConfig().
             }
         }
 
@@ -113,7 +117,11 @@ class MobileScanner(
      */
     @ExperimentalGetImage
     val captureOutput = ImageAnalysis.Analyzer { imageProxy ->
-        val mediaImage = imageProxy.image ?: return@Analyzer
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            imageProxy.close()
+            return@Analyzer
+        }
 
         if (detectionSpeed == DetectionSpeed.NORMAL && scannerTimeout) {
             imageProxy.close()
@@ -134,39 +142,51 @@ class MobileScanner(
             InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
         }
 
-        scanner?.let {
-            it.process(inputImage).addOnSuccessListener { barcodes ->
-                if (detectionSpeed == DetectionSpeed.NO_DUPLICATES) {
-                    val newScannedBarcodes = barcodes.mapNotNull {
-                        barcode -> barcode.rawValue
-                    }.sorted()
+        fun closeFrame() {
+            invertedBitmap?.recycle()
+            imageProxy.close()
+        }
 
-                    if (newScannedBarcodes == lastScanned) {
-                        // New scanned is duplicate, returning
-                        imageProxy.close()
-                        return@addOnSuccessListener
-                    }
-                    if (newScannedBarcodes.isNotEmpty()) {
-                        lastScanned = newScannedBarcodes
-                    }
-                }
+        val activeScanner = scanner
+        if (activeScanner == null) {
+            closeFrame()
+            return@Analyzer
+        }
 
+        try {
+            activeScanner.process(inputImage).addOnSuccessListener { barcodes ->
                 val barcodeMap: MutableList<Map<String, Any?>> = mutableListOf()
+                val scannedBarcodeValues: MutableList<String> = mutableListOf()
 
                 for (barcode in barcodes) {
                     if (scanWindow == null) {
                         barcodeMap.add(barcode.data)
+                        barcode.rawValue?.let { scannedBarcodeValues.add(it) }
                         continue
                     }
 
                     if (isBarcodeInScanWindow(scanWindow!!, barcode, imageProxy)) {
                         barcodeMap.add(barcode.data)
+                        barcode.rawValue?.let { scannedBarcodeValues.add(it) }
                     }
                 }
 
                 if (barcodeMap.isEmpty()) {
-                    imageProxy.close()
+                    closeFrame()
                     return@addOnSuccessListener
+                }
+
+                if (detectionSpeed == DetectionSpeed.NO_DUPLICATES) {
+                    val newScannedBarcodes = scannedBarcodeValues.sorted()
+
+                    if (newScannedBarcodes == lastScanned) {
+                        // New scanned is duplicate, returning
+                        closeFrame()
+                        return@addOnSuccessListener
+                    }
+                    if (newScannedBarcodes.isNotEmpty()) {
+                        lastScanned = newScannedBarcodes
+                    }
                 }
 
                 val portrait = (camera?.cameraInfo?.sensorRotationDegrees ?: 0) % 180 == 0
@@ -177,9 +197,7 @@ class MobileScanner(
                         null,
                         if (portrait) inputImage.width else inputImage.height,
                         if (portrait) inputImage.height else inputImage.width)
-                    // Clean up the inverted bitmap if we created one
-                    invertedBitmap?.recycle()
-                    imageProxy.close()
+                    closeFrame()
                     return@addOnSuccessListener
                 }
 
@@ -227,7 +245,11 @@ class MobileScanner(
                 mobileScannerErrorCallback(
                     e.localizedMessage ?: e.toString()
                 )
+                closeFrame()
             }
+        } catch (e: Exception) {
+            mobileScannerErrorCallback(e.localizedMessage ?: e.toString())
+            closeFrame()
         }
 
         if (detectionSpeed == DetectionSpeed.NORMAL) {
