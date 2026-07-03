@@ -961,7 +961,11 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     }
 
     func stop(_ call: FlutterMethodCall, _ result: FlutterResult) {
-        let force = (call.arguments as? Bool) ?? false
+        // The Dart side sends the flag as a map (`{"force": <bool>}`), so read
+        // it out of the arguments dictionary. Reading `call.arguments as? Bool`
+        // always yielded nil here, which meant `force` never reached native and
+        // a forced stop behaved like a regular one.
+        let force = (call.arguments as? [String: Any])?["force"] as? Bool ?? false
         if (!paused && stopped && !force) {
             result(nil)
 
