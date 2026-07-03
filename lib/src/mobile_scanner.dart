@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/src/method_channel/mobile_scanner_method_channel.dart';
@@ -176,20 +175,30 @@ class _MobileScannerState extends State<MobileScanner>
     controller = widget.controller ?? MobileScannerController();
 
     controller.attach();
-    // If debug mode is enabled, stop the controller first before starting it.
-    // If a hot-restart is initiated, the controller won't be stopped, and
-    // because there is no way of knowing if a hot-restart has happened,
-    // we must assume every start is a hot-restart. Related issue:
-    // https://github.com/flutter/flutter/issues/10437
-    if (kDebugMode) {
-      if (MobileScannerPlatform.instance
-          case final MethodChannelMobileScanner implementation) {
-        try {
-          await implementation.stop(force: true);
-        } on Exception catch (e) {
-          // Don't do anything if the controller is already stopped.
-          debugPrint('$e');
-        }
+    // Always stop any previously-attached scanner before starting this one.
+    //
+    // This must run in ALL build modes, not just debug, for two reasons:
+    //  1. Hot-restart: a hot-restart does not stop the controller and there is
+    //     no way to detect one, so every start must assume a stale native
+    //     session. https://github.com/flutter/flutter/issues/10437
+    //  2. Barcode-sink race: barcodes are published through a single
+    //     process-wide FlutterEventSink, set in the barcode EventChannel's
+    //     `onListen` and cleared in `onCancel`. When one scanner tears down
+    //     while another mounts, the old subscription's late `cancel` can be
+    //     delivered AFTER the new scanner's `listen`, clearing the freshly-set
+    //     sink (and the inbound message handler). The camera preview keeps
+    //     rendering but every barcode is silently dropped. Awaiting this
+    //     force-stop drains the pending teardown callbacks before the new
+    //     `listen`, closing the race. Gating it on `kDebugMode` left release
+    //     builds exposed — observed as "live preview, zero scans" whenever a
+    //     scanner is opened shortly after another was closed.
+    if (MobileScannerPlatform.instance
+        case final MethodChannelMobileScanner implementation) {
+      try {
+        await implementation.stop(force: true);
+      } on Exception catch (e) {
+        // Don't do anything if the controller is already stopped.
+        debugPrint('$e');
       }
     }
 

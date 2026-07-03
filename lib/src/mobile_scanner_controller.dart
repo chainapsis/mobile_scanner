@@ -797,6 +797,12 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
     }
 
     _isDisposed = true;
+    // Cancel the platform stream subscriptions. `_stop()` normally does this,
+    // but it early-returns once `_isDisposed` is set, so disposing without a
+    // preceding stop() would otherwise leak them — and a leaked barcode
+    // subscription's later cancel is exactly what can clobber the shared
+    // barcode sink of the next scanner (see _initializeController).
+    _disposeListeners();
     unawaited(_barcodesController.close());
     super.dispose();
 
