@@ -530,12 +530,32 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
     List<double>? points;
 
     if (window != null) {
-      points = [window.left, window.top, window.right, window.bottom];
+      final sourceWindow =
+          !kIsWeb && defaultTargetPlatform == TargetPlatform.windows
+              ? mirrorScanWindowHorizontally(window)
+              : window;
+      points = [
+        sourceWindow.left,
+        sourceWindow.top,
+        sourceWindow.right,
+        sourceWindow.bottom,
+      ];
     }
 
     await methodChannel.invokeMethod<void>(kUpdateScanWindowMethodName, {
       'rect': points,
     });
+  }
+
+  /// Maps a scan window from a mirrored preview back to source-frame space.
+  @visibleForTesting
+  static Rect mirrorScanWindowHorizontally(Rect window) {
+    return Rect.fromLTRB(
+      1 - window.right,
+      window.top,
+      1 - window.left,
+      window.bottom,
+    );
   }
 
   @override
