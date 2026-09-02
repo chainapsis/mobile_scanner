@@ -33,7 +33,7 @@ See the example app for detailed implementation information.
 | analyzeImage | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
 | returnImage  | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
 | scanWindow   | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
-| autoZoom     | :heavy_check_mark: | :x:                | :x:                | :x: |
+| autoZoom     | :x:                | :x:                | :x:                | :x: |
 | lensType     | :heavy_check_mark: | :heavy_check_mark: | :x:                | :x: |
 
 ## Installation
@@ -52,16 +52,9 @@ Then run:
 ## Configuration
 
 ### Android
-This package uses by default the **bundled version** of MLKit Barcode-scanning for Android. This version is immediately available to the device. But it will increase the size of the app by approximately 3 to 10 MB.
+This fork uses the Apache-2.0-licensed [ZXing-C++ Android library](https://github.com/zxing-cpp/zxing-cpp/tree/master/wrappers/android). The decoder is bundled with the app and does not require Google Play Services or a model download.
 
-The alternative is to use the **unbundled version** of MLKit Barcode-scanning for Android. This version is downloaded on first use via Google Play Services. It increases the app size by around 600KB.
-
-[You can read more about the difference between the two versions here.](https://developers.google.com/ml-kit/vision/barcode-scanning/android)
-
-To use the **unbundled version** of the MLKit Barcode-scanning, add the following line to your `/android/gradle.properties` file:
-```
-dev.steenbakker.mobile_scanner.useUnbundled=true
-```
+The Android decoder returns the raw value, raw bytes, format, corner points, and bounding size. ML Kit-specific structured metadata such as parsed contact, calendar, Wi-Fi, and driver-license fields is not populated. `autoZoom` is also not supported by this decoder.
 
 ### iOS
 
@@ -283,4 +276,4 @@ This means arbitrary binary payloads that happen to contain bytes in the `0x80`â
 
 #### Android and Web
 
-`rawBytes` is fully supported for all formats and encoding modes via MLKit (Android) and the ZXing-based library (Web).
+`rawBytes` is fully supported for all formats and encoding modes via ZXing-C++ (Android) and the ZXing-based library (Web).

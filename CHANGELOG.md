@@ -7,6 +7,7 @@
 
 **Improvements**
 
+* [Android] Replaced ML Kit barcode scanning with the bundled Apache-2.0 ZXing-C++ decoder, removing the Google Play Services dependency.
 * [Android] Migrated barcode bounding box from `boundingBox` to `cornerPoints` for more accurate scan window detection.
 * Added support for `ITF-Two-of-Five`.
 * Added constants for testing the method channel methods in `MobileScannerMethods` and `MobileScannerEvents`.

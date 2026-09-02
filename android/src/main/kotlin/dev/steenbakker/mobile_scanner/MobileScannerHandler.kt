@@ -2,16 +2,15 @@ package dev.steenbakker.mobile_scanner
 
 import android.app.Activity
 import android.content.Context
-import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraManager.AvailabilityCallback
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.Size
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ExperimentalLensFacing
-import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import dev.steenbakker.mobile_scanner.objects.BarcodeFormats
 import dev.steenbakker.mobile_scanner.objects.DetectionSpeed
 import dev.steenbakker.mobile_scanner.objects.MobileScannerErrorCodes
@@ -23,7 +22,7 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.EventChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
-import com.google.mlkit.vision.barcode.ZoomSuggestionOptions
+import zxingcpp.BarcodeReader
 
 class MobileScannerHandler(
     private val activity: Activity,
@@ -203,7 +202,10 @@ class MobileScannerHandler(
         val invertImage: Boolean = call.argument<Boolean>("invertImage") ?: false
         val initialZoom: Double? = call.argument<Double?>("initialZoom")
 
-        val barcodeScannerOptions: BarcodeScannerOptions? = buildBarcodeScannerOptions(formats, autoZoom)
+        if (autoZoom) {
+            Log.w("MobileScanner", "autoZoom is not supported by the ZXing-C++ decoder")
+        }
+        val barcodeScannerOptions = buildBarcodeScannerOptions(formats, invertImage)
 
         val position = MobileScannerCameraLensSelector.selectCamera(
             cameraManager,
@@ -277,7 +279,6 @@ class MobileScannerHandler(
             },
             timeout.toLong(),
             cameraResolution,
-            invertImage,
             initialZoom
         )
     }
@@ -373,14 +374,6 @@ class MobileScannerHandler(
         }
     }
 
-    private fun setZoomRatio(scale: Float) : Boolean {
-        try {
-            mobileScanner!!.setZoomRatio(scale.toDouble())
-            return true
-        } catch (e: ZoomWhenStopped) { }
-        return false
-    }
-
     private fun resetScale(result: MethodChannel.Result) {
         try {
             mobileScanner!!.resetScale()
@@ -397,54 +390,22 @@ class MobileScannerHandler(
         result.success(null)
     }
 
-    private fun buildBarcodeScannerOptions(formats: List<Int>?, autoZoom: Boolean): BarcodeScannerOptions? {
-        val builder : BarcodeScannerOptions.Builder?
-        if (formats == null) {
-            builder = BarcodeScannerOptions.Builder()
-        } else {
-            val formatsList: MutableList<Int> = mutableListOf()
+    private fun buildBarcodeScannerOptions(
+        formats: List<Int>?,
+        tryInvert: Boolean,
+    ): BarcodeReader.Options {
+        val zxingFormats = formats
+            ?.mapNotNull { BarcodeFormats.fromRawValue(it).zxingFormat }
+            ?.toSet()
+            ?: emptySet()
 
-            for (formatValue in formats) {
-                formatsList.add(BarcodeFormats.fromRawValue(formatValue).intValue)
-            }
-
-            if (formatsList.size == 1) {
-                builder = BarcodeScannerOptions.Builder().setBarcodeFormats(formatsList.first())
-            } else {
-                builder = BarcodeScannerOptions.Builder().setBarcodeFormats(
-                    formatsList.first(),
-                    *formatsList.subList(1, formatsList.size).toIntArray()
-                )
-            }
-        }
-
-        if (autoZoom) {
-            builder.setZoomSuggestionOptions(
-                ZoomSuggestionOptions.Builder {
-                    setZoomRatio(it)
-                }.setMaxSupportedZoomRatio(getMaxZoomRatio())
-                    .build())
-        }
-
-        return builder.build()
-    }
-
-    private fun getMaxZoomRatio(): Float {
-        var maxZoom = 1.0F
-
-        try {
-            for (cameraId in cameraManager.cameraIdList) {
-                val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-
-                val maxZoomRatio = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
-                if (maxZoomRatio != null && maxZoomRatio > maxZoom) {
-                    maxZoom = maxZoomRatio
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return maxZoom
+        return BarcodeReader.Options(
+            formats = zxingFormats,
+            tryHarder = true,
+            tryRotate = true,
+            tryInvert = tryInvert,
+            tryDownscale = true,
+        )
     }
 
     private fun setFocus(call: MethodCall, result: MethodChannel.Result) {
